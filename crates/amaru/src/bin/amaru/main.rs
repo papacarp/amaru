@@ -100,6 +100,10 @@ enum Command {
     /// This command is only relevant when one upgrades Amaru to a newer version that
     /// requires changes in the database format.
     MigrateChainDB(cmd::migrate_chain_db::Args),
+
+    /// Calculate and display current stake distribution by pool ID.
+    /// This reads from the ledger database and can be run independently of the running node.
+    StakeSummary(cmd::stake_summary::Args),
 }
 
 #[derive(Debug, Parser)]
@@ -186,6 +190,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::ConvertLedgerState(args) => cmd::convert_ledger_state::run(args).await,
         Command::DumpChainDB(args) => cmd::dump_chain_db::run(args).await,
         Command::MigrateChainDB(args) => cmd::migrate_chain_db::run(args).await,
+        Command::StakeSummary(args) => {
+            cmd::stake_summary::run(args).map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())) as Box<dyn std::error::Error>)
+        },
     };
 
     // TODO: we might also want to integrate this into a graceful shutdown system, and into a panic hook

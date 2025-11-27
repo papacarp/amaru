@@ -261,7 +261,16 @@ impl ReadOnlyRocksDB {
     pub fn new(config: RocksDbConfig) -> Result<Self, StoreError> {
         let dir = config.dir.clone();
         assert_sufficient_snapshots(&dir)?;
-        let opts = set_default_opts(config.into());
+        let mut opts = set_default_opts(config.into());
+        
+        // Optimize for read-only access: don't create files, don't write stats, etc.
+        // These settings help avoid conflicts with a running node
+        opts.set_max_open_files(10000); // Reasonable limit for read-only access
+        opts.set_paranoid_checks(false); // Skip paranoid checks for read-only (faster, less locking)
+        
+        // open_for_read_only with error_if_log_file_exist=false means:
+        // - Uses shared locks (won't conflict with writer)
+        // - Won't error if log files exist (normal during active sync)
         rocksdb::DB::open_for_read_only(&opts, dir.join("live"), false)
             .map(|db| ReadOnlyRocksDB { db })
             .map_err(|err| StoreError::Internal(err.into()))

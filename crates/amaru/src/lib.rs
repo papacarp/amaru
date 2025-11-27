@@ -27,6 +27,9 @@ pub mod observability;
 /// Generic exit handler
 pub mod exit;
 
+/// Live stake tracking utilities
+pub mod live_stake_tracker;
+
 pub const SNAPSHOTS_DIR: &str = "snapshots";
 
 pub fn snapshots_dir(network: NetworkName) -> String {
