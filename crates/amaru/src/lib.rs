@@ -27,6 +27,12 @@ pub mod observability;
 /// Generic exit handler
 pub mod exit;
 
+/// Rewards breakdown event hook for capturing leader rewards separation
+pub mod rewards_hook;
+
+/// File-based logger for rewards breakdown events
+pub mod rewards_file_logger;
+
 pub const SNAPSHOTS_DIR: &str = "snapshots";
 
 pub fn snapshots_dir(network: NetworkName) -> String {
