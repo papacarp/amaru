@@ -423,6 +423,16 @@ struct RewardsSummaryVisitor {
     pots_reserves: Option<u64>,
     pots_treasury: Option<u64>,
     pots_fees: Option<u64>,
+    expected_blocks: Option<u64>,
+    influence: Option<f64>,
+    max_bh_size: Option<u16>,
+    max_block_size: Option<u64>,
+    max_epoch: Option<u64>,
+    monetary_expansion_rate: Option<f64>,
+    optimal_pool_count: Option<u16>,
+    protocol_major: Option<u64>,
+    protocol_minor: Option<u64>,
+    treasury_growth_rate: Option<f64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -438,6 +448,16 @@ struct RewardsSummaryData {
     pots_reserves: u64,
     pots_treasury: u64,
     pots_fees: u64,
+    expected_blocks: u64,
+    influence: f64,
+    max_bh_size: u16,
+    max_block_size: u64,
+    max_epoch: u64,
+    monetary_expansion_rate: f64,
+    optimal_pool_count: u16,
+    protocol_major: u64,
+    protocol_minor: u64,
+    treasury_growth_rate: f64,
 }
 
 impl RewardsSummaryVisitor {
@@ -448,7 +468,10 @@ impl RewardsSummaryVisitor {
         
         if let (Some(epoch), Some(efficiency), Some(incentives), Some(treasury_tax),
                 Some(total_rewards), Some(available_rewards), Some(effective_rewards),
-                Some(pots_reserves), Some(pots_treasury), Some(pots_fees)) = (
+                Some(pots_reserves), Some(pots_treasury), Some(pots_fees),
+                Some(expected_blocks), Some(influence), Some(max_bh_size), Some(max_block_size),
+                Some(max_epoch), Some(monetary_expansion_rate), Some(optimal_pool_count),
+                Some(protocol_major), Some(protocol_minor), Some(treasury_growth_rate)) = (
             self.epoch,
             self.efficiency.as_ref(),
             self.incentives,
@@ -459,6 +482,16 @@ impl RewardsSummaryVisitor {
             self.pots_reserves,
             self.pots_treasury,
             self.pots_fees,
+            self.expected_blocks,
+            self.influence,
+            self.max_bh_size,
+            self.max_block_size,
+            self.max_epoch,
+            self.monetary_expansion_rate,
+            self.optimal_pool_count,
+            self.protocol_major,
+            self.protocol_minor,
+            self.treasury_growth_rate,
         ) {
             // Parse efficiency fraction (e.g., "5293/5400")
             let (num, den) = if let Some((n, d)) = efficiency.split_once('/') {
@@ -483,6 +516,16 @@ impl RewardsSummaryVisitor {
                 pots_reserves,
                 pots_treasury,
                 pots_fees,
+                expected_blocks,
+                influence,
+                max_bh_size,
+                max_block_size,
+                max_epoch,
+                monetary_expansion_rate,
+                optimal_pool_count,
+                protocol_major,
+                protocol_minor,
+                treasury_growth_rate,
             });
         }
     }
@@ -508,6 +551,37 @@ impl tracing::field::Visit for RewardsSummaryVisitor {
             }
             "effective_rewards" => {
                 self.effective_rewards = Some(value);
+            }
+            "expected_blocks" => {
+                self.expected_blocks = Some(value);
+            }
+            "max_block_size" => {
+                self.max_block_size = Some(value);
+            }
+            "max_epoch" => {
+                self.max_epoch = Some(value);
+            }
+            "protocol_major" => {
+                self.protocol_major = Some(value);
+            }
+            "protocol_minor" => {
+                self.protocol_minor = Some(value);
+            }
+            _ => {}
+        }
+        self.try_create_summary_data();
+    }
+    
+    fn record_f64(&mut self, field: &tracing::field::Field, value: f64) {
+        match field.name() {
+            "influence" => {
+                self.influence = Some(value);
+            }
+            "monetary_expansion_rate" => {
+                self.monetary_expansion_rate = Some(value);
+            }
+            "treasury_growth_rate" => {
+                self.treasury_growth_rate = Some(value);
             }
             _ => {}
         }
@@ -553,6 +627,62 @@ impl tracing::field::Visit for RewardsSummaryVisitor {
             "effective_rewards" => {
                 if let Ok(val) = cleaned.parse::<u64>() {
                     self.effective_rewards = Some(val);
+                }
+            }
+            "expected_blocks" => {
+                if let Ok(val) = cleaned.parse::<u64>() {
+                    self.expected_blocks = Some(val);
+                }
+            }
+            "influence" => {
+                if let Ok(val) = cleaned.parse::<f64>() {
+                    self.influence = Some(val);
+                }
+            }
+            "max_bh_size" => {
+                // u16 values come through as u64 when Display-formatted, so parse as u64 first
+                if let Ok(val) = cleaned.parse::<u64>() {
+                    if val <= u16::MAX as u64 {
+                        self.max_bh_size = Some(val as u16);
+                    }
+                }
+            }
+            "max_block_size" => {
+                if let Ok(val) = cleaned.parse::<u64>() {
+                    self.max_block_size = Some(val);
+                }
+            }
+            "max_epoch" => {
+                if let Ok(val) = cleaned.parse::<u64>() {
+                    self.max_epoch = Some(val);
+                }
+            }
+            "monetary_expansion_rate" => {
+                if let Ok(val) = cleaned.parse::<f64>() {
+                    self.monetary_expansion_rate = Some(val);
+                }
+            }
+            "optimal_pool_count" => {
+                // u16 values come through as u64 when Display-formatted, so parse as u64 first
+                if let Ok(val) = cleaned.parse::<u64>() {
+                    if val <= u16::MAX as u64 {
+                        self.optimal_pool_count = Some(val as u16);
+                    }
+                }
+            }
+            "protocol_major" => {
+                if let Ok(val) = cleaned.parse::<u64>() {
+                    self.protocol_major = Some(val);
+                }
+            }
+            "protocol_minor" => {
+                if let Ok(val) = cleaned.parse::<u64>() {
+                    self.protocol_minor = Some(val);
+                }
+            }
+            "treasury_growth_rate" => {
+                if let Ok(val) = cleaned.parse::<f64>() {
+                    self.treasury_growth_rate = Some(val);
                 }
             }
             _ => {

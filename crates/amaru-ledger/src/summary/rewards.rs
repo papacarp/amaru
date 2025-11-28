@@ -530,6 +530,14 @@ impl RewardsSummary {
             },
         );
 
+        // Calculate expected_blocks from epoch_length and active_slot_coeff
+        let expected_blocks = global_parameters.epoch_length as u64 / global_parameters.active_slot_coeff_inverse as u64;
+        
+        // Convert RationalNumber to f64 for influence, monetary_expansion_rate, treasury_growth_rate
+        let influence = protocol_parameters.pledge_influence.numerator as f64 / protocol_parameters.pledge_influence.denominator as f64;
+        let monetary_expansion_rate = protocol_parameters.monetary_expansion_rate.numerator as f64 / protocol_parameters.monetary_expansion_rate.denominator as f64;
+        let treasury_growth_rate = protocol_parameters.treasury_expansion_rate.numerator as f64 / protocol_parameters.treasury_expansion_rate.denominator as f64;
+        
         info!(
             target: EVENT_TARGET,
             epoch = %stake_distribution.epoch,
@@ -542,6 +550,16 @@ impl RewardsSummary {
             pots.reserves = %pots.reserves,
             pots.treasury = %pots.treasury,
             pots.fees = %pots.fees,
+            expected_blocks = %expected_blocks,
+            influence = %influence,
+            max_bh_size = %protocol_parameters.max_block_header_size,
+            max_block_size = %protocol_parameters.max_block_body_size,
+            max_epoch = %protocol_parameters.stake_pool_max_retirement_epoch,
+            monetary_expansion_rate = %monetary_expansion_rate,
+            optimal_pool_count = %protocol_parameters.optimal_stake_pools_count,
+            protocol_major = %protocol_parameters.protocol_version.0,
+            protocol_minor = %protocol_parameters.protocol_version.1,
+            treasury_growth_rate = %treasury_growth_rate,
             "rewards.summary",
         );
 
