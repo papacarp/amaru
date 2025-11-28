@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::rewards_file_logger;
+use crate::{rewards_file_logger, snapshot_file_logger};
 use opentelemetry::trace::TracerProvider;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::{metrics::SdkMeterProvider, trace::SdkTracerProvider};
@@ -36,7 +36,7 @@ use tracing_subscriber::{
 
 const AMARU_LOG_VAR: &str = "AMARU_LOG";
 
-const DEFAULT_AMARU_LOG_FILTER: &str = "error,amaru=debug,amaru::ledger::state::rewards=off";
+const DEFAULT_AMARU_LOG_FILTER: &str = "error,amaru=debug,amaru::ledger::state::rewards=off,amaru::ledger::state::stake_distribution=off";
 
 const AMARU_TRACE_VAR: &str = "AMARU_TRACE";
 
@@ -114,6 +114,14 @@ impl TracingSubscriber<Registry> {
     }
     
     pub fn init_with_rewards_file(self, rewards_file_path: Option<std::path::PathBuf>) {
+        self.init_with_file_loggers(rewards_file_path, None)
+    }
+    
+    pub fn init_with_file_loggers(
+        self, 
+        rewards_file_path: Option<std::path::PathBuf>,
+        snapshot_file_path: Option<std::path::PathBuf>,
+    ) {
         let (default_filter, warning) = new_default_filter(AMARU_LOG_VAR, DEFAULT_AMARU_LOG_FILTER);
 
         let log_format = || {
@@ -130,6 +138,12 @@ impl TracingSubscriber<Registry> {
         } else {
             None
         };
+        
+        let snapshot_logger = if let Some(ref path) = snapshot_file_path {
+            snapshot_file_logger::SnapshotFileLogger::new(path.clone()).ok()
+        } else {
+            None
+        };
 
         match self {
             TracingSubscriber::Empty => unreachable!(),
@@ -142,10 +156,19 @@ impl TracingSubscriber<Registry> {
                             .with_span_events(log_events())
                             .with_filter(log_filter()),
                     );
-                if let Some(logger) = rewards_logger {
-                    subscriber.with(logger).init();
-                } else {
-                    subscriber.init();
+                match (rewards_logger, snapshot_logger) {
+                    (Some(rewards), Some(snapshot)) => {
+                        subscriber.with(rewards).with(snapshot).init();
+                    }
+                    (Some(rewards), None) => {
+                        subscriber.with(rewards).init();
+                    }
+                    (None, Some(snapshot)) => {
+                        subscriber.with(snapshot).init();
+                    }
+                    (None, None) => {
+                        subscriber.init();
+                    }
                 }
             }
             TracingSubscriber::WithOpenTelemetry(layered) => {
@@ -157,24 +180,51 @@ impl TracingSubscriber<Registry> {
                             .with_span_events(log_events())
                             .with_filter(log_filter()),
                     );
-                if let Some(logger) = rewards_logger {
-                    subscriber.with(logger).init();
-                } else {
-                    subscriber.init();
+                match (rewards_logger, snapshot_logger) {
+                    (Some(rewards), Some(snapshot)) => {
+                        subscriber.with(rewards).with(snapshot).init();
+                    }
+                    (Some(rewards), None) => {
+                        subscriber.with(rewards).init();
+                    }
+                    (None, Some(snapshot)) => {
+                        subscriber.with(snapshot).init();
+                    }
+                    (None, None) => {
+                        subscriber.init();
+                    }
                 }
             }
             TracingSubscriber::WithJson(layered) => {
-                if let Some(logger) = rewards_logger {
-                    layered.with(logger).init();
-                } else {
-                    layered.init();
+                match (rewards_logger, snapshot_logger) {
+                    (Some(rewards), Some(snapshot)) => {
+                        layered.with(rewards).with(snapshot).init();
+                    }
+                    (Some(rewards), None) => {
+                        layered.with(rewards).init();
+                    }
+                    (None, Some(snapshot)) => {
+                        layered.with(snapshot).init();
+                    }
+                    (None, None) => {
+                        layered.init();
+                    }
                 }
             }
             TracingSubscriber::WithBoth(layered) => {
-                if let Some(logger) = rewards_logger {
-                    layered.with(logger).init();
-                } else {
-                    layered.init();
+                match (rewards_logger, snapshot_logger) {
+                    (Some(rewards), Some(snapshot)) => {
+                        layered.with(rewards).with(snapshot).init();
+                    }
+                    (Some(rewards), None) => {
+                        layered.with(rewards).init();
+                    }
+                    (None, Some(snapshot)) => {
+                        layered.with(snapshot).init();
+                    }
+                    (None, None) => {
+                        layered.init();
+                    }
                 }
             }
         };

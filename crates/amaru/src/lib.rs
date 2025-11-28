@@ -36,6 +36,9 @@ pub mod rewards_hook;
 /// File-based logger for rewards breakdown events
 pub mod rewards_file_logger;
 
+/// File-based logger for stake distribution snapshot events
+pub mod snapshot_file_logger;
+
 pub const SNAPSHOTS_DIR: &str = "snapshots";
 
 pub fn snapshots_dir(network: NetworkName) -> String {

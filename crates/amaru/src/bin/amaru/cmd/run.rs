@@ -93,6 +93,9 @@ pub struct Args {
 
     #[arg(long, value_name = "BASE_PATH", env = "AMARU_REWARDS_FILE")]
     pub rewards_file: Option<PathBuf>,
+    
+    #[arg(long, value_name = "BASE_PATH", env = "AMARU_SNAPSHOT_FILE")]
+    pub snapshot_file: Option<PathBuf>,
 }
 
 pub async fn run(

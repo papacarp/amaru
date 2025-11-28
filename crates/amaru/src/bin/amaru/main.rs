@@ -180,7 +180,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let result = match args.command {
         Command::Run(run_args) => {
-            subscriber.init_with_rewards_file(run_args.rewards_file.clone());
+            subscriber.init_with_file_loggers(
+                run_args.rewards_file.clone(),
+                run_args.snapshot_file.clone(),
+            );
             cmd::run::run(run_args, metrics).await
         },
         Command::ImportLedgerState(args) => cmd::import_ledger_state::run(args).await,
