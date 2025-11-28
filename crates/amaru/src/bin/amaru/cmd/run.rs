@@ -90,6 +90,9 @@ pub struct Args {
     /// By default, the migration is not performed automatically, checkout `migrate-chain-db` command.
     #[arg(long, action = ArgAction::SetTrue, default_value_t = false, env = "AMARU_MIGRATE_CHAIN_DB")]
     migrate_chain_db: bool,
+
+    #[arg(long, value_name = "BASE_PATH", env = "AMARU_REWARDS_FILE")]
+    pub rewards_file: Option<PathBuf>,
 }
 
 pub async fn run(

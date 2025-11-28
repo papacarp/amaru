@@ -164,8 +164,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    subscriber.init();
-
     // NOTE: Both warnings are bound to the same ENV var, so `.or` prevents from logging it twice.
     if let Some(notify) = warning_otlp.or(warning_json) {
         notify();
@@ -181,7 +179,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let result = match args.command {
-        Command::Run(args) => cmd::run::run(args, metrics).await,
+        Command::Run(run_args) => {
+            subscriber.init_with_rewards_file(run_args.rewards_file.clone());
+            cmd::run::run(run_args, metrics).await
+        },
         Command::ImportLedgerState(args) => cmd::import_ledger_state::run(args).await,
         Command::ImportHeaders(args) => cmd::import_headers::run(args).await,
         Command::ImportNonces(args) => cmd::import_nonces::run(args).await,
