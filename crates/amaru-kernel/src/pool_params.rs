@@ -139,7 +139,14 @@ impl serde::Serialize for PoolParams {
             }
         }
 
-        let mut s = serializer.serialize_struct("PoolParams", 9)?;
+        // Extract hex-encoded stake credential from reward account
+        let reward_account_hex = crate::expect_stake_credential(&self.reward_account);
+        let reward_account_hex_str = match reward_account_hex {
+            crate::StakeCredential::AddrKeyhash(hash) => hex::encode(hash.as_slice()),
+            crate::StakeCredential::ScriptHash(hash) => hex::encode(hash.as_slice()),
+        };
+
+        let mut s = serializer.serialize_struct("PoolParams", 10)?;
         s.serialize_field("id", &hex::encode(self.id))?;
         s.serialize_field("vrfVerificationKeyHash", &hex::encode(self.vrf))?;
         s.serialize_field("pledge", &as_lovelace_map(self.pledge))?;
@@ -149,6 +156,7 @@ impl serde::Serialize for PoolParams {
             "rewardAccount",
             &as_bech32_addr(&self.reward_account).map_err(serde::ser::Error::custom)?,
         )?;
+        s.serialize_field("rewardAccountHex", &reward_account_hex_str)?;
         s.serialize_field(
             "owners",
             &self.owners.iter().map(hex::encode).collect::<Vec<String>>(),

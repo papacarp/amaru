@@ -33,10 +33,12 @@ use serde_json;
 use std::collections::BTreeMap;
 use tracing::info;
 
-// Helper struct for serializing accounts with only lovelace
+// Helper struct for serializing accounts with lovelace and delegation info
 #[derive(serde::Serialize)]
 struct AccountLovelaceOnly {
     lovelace: Lovelace,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pool: Option<String>, // Hex-encoded pool ID if delegated
 }
 
 const EVENT_TARGET: &str = "amaru::ledger::state::stake_distribution";
@@ -294,7 +296,7 @@ impl StakeDistribution {
                 .and_modify(|pool| pool.blocks_count += 1);
         });
 
-        // Serialize accounts (only lovelace) and pools to JSON for the event
+        // Serialize accounts with lovelace and delegation info
         let accounts_json: BTreeMap<String, AccountLovelaceOnly> = accounts
             .iter()
             .map(|(credential, account)| {
@@ -302,7 +304,11 @@ impl StakeDistribution {
                     StakeCredential::AddrKeyhash(hash) => hex::encode(hash.as_slice()),
                     StakeCredential::ScriptHash(hash) => hex::encode(hash.as_slice()),
                 };
-                (credential_hex, AccountLovelaceOnly { lovelace: account.lovelace })
+                let pool_hex = account.pool.as_ref().map(|pool_id| hex::encode(pool_id));
+                (credential_hex, AccountLovelaceOnly { 
+                    lovelace: account.lovelace,
+                    pool: pool_hex,
+                })
             })
             .collect();
         

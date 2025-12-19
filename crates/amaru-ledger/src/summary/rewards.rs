@@ -725,6 +725,40 @@ impl RewardsSummary {
             "rewards.leader_breakdown"
         );
 
+        // Emit individual owner stake rewards before consolidation
+        // This allows tracking individual owner rewards separately from the consolidated reward account
+        if owner_stake > 0 && rewards_staking > 0 {
+            for owner_hash in &pool.parameters.owners {
+                let owner_credential = StakeCredential::AddrKeyhash(*owner_hash);
+                if let Some(account) = stake_distribution.accounts.get(&owner_credential) {
+                    // Only include owners that are actually delegated to this pool
+                    if account.pool == Some(pool.parameters.id) {
+                        let owner_individual_stake = account.lovelace;
+                        if owner_individual_stake > 0 {
+                            // Calculate proportional stake reward for this owner
+                            // Formula: (total_staking_rewards * owner_individual_stake) / owner_stake
+                            // Use SafeRatio to avoid overflow
+                            let owner_staking_reward = floor_to_lovelace(
+                                SafeRatio::from_integer(BigUint::from(rewards_staking))
+                                    * BigUint::from(owner_individual_stake)
+                                    / BigUint::from(owner_stake)
+                            );
+                            
+                            let owner_hex = hex::encode(owner_hash.as_slice());
+                            tracing::debug!(
+                                target: EVENT_TARGET,
+                                epoch = %stake_distribution.epoch,
+                                stake_credential_hex = %owner_hex,
+                                leader_reward = 0u64,
+                                stake_reward = %owner_staking_reward,
+                                "rewards.account_breakdown"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         let reward_account = expect_stake_credential(&pool.parameters.reward_account);
         let reward_account_hex = match &reward_account {
             StakeCredential::AddrKeyhash(hash) => hex::encode(hash.as_slice()),

@@ -8,10 +8,11 @@ use amaru_stores::rocksdb::{ReadOnlyRocksDB, RocksDbConfig};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-/// Sum stake by pool ID from the UTxO set
+/// Sum stake by pool ID from accounts and UTxO set
 /// 
-/// This function opens a read-only connection to the store, iterates over all UTxOs,
-/// extracts stake credentials, looks up account delegations, and sums stake by pool ID.
+/// This function opens a read-only connection to the store, iterates over all accounts,
+/// initializes stake with account rewards, adds UTxO values, and sums stake by pool ID.
+/// This matches the approach used in stake distribution snapshots.
 /// 
 /// **Note:** This function uses read-only database access and should not interfere with
 /// a running node. However, if the node is actively syncing, the data may be slightly
@@ -36,7 +37,14 @@ pub fn calculate_stake_by_pool(
             ).into())
         })?;
 
-    // First pass: sum stake by credential from UTxO
+    // First pass: initialize stake from accounts (includes rewards that haven't been withdrawn)
+    // This matches the stake distribution approach which starts with accounts, not UTxO
+    for (credential, account) in db.iter_accounts()? {
+        // Initialize with account rewards (rewards that haven't been withdrawn yet)
+        stake_by_credential.insert(credential, account.rewards);
+    }
+
+    // Second pass: add UTxO values to existing accounts (or create new entries)
     let utxos = db.iter_utxos()?;
     for (_, output) in utxos {
         if let Some(credential) = output_stake_credential(&output) {
@@ -45,7 +53,7 @@ pub fn calculate_stake_by_pool(
         }
     }
 
-    // Second pass: map credentials to pools via accounts
+    // Third pass: map credentials to pools via accounts
     for (credential, total_stake) in stake_by_credential {
         if let Ok(Some(account)) = db.account(&credential) {
             if let Some((pool_id, _)) = account.pool {
