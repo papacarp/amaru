@@ -426,7 +426,7 @@ pub fn setup_observability_with_subscriber(
     service_name: String,
     span_url: String,
     metric_url: String,
-    mut subscriber: TracingSubscriber<Registry>,
+    subscriber: TracingSubscriber<Registry>,
 ) -> (
     Option<SdkMeterProvider>,
     Box<dyn FnOnce() -> Result<(), Box<dyn std::error::Error>>>,
