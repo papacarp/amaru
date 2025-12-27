@@ -14,10 +14,10 @@
 
 use crate::cmd::default_chain_dir;
 use crate::pid::with_optional_pid_file;
-use crate::{cmd::default_ledger_dir, metrics::track_system_metrics};
+use crate::cmd::default_ledger_dir;
+use amaru::metrics::track_system_metrics;
 use amaru::stages::{Config, MaxExtraLedgerSnapshots, StoreType, build_and_run_network};
 use amaru_kernel::network::NetworkName;
-use amaru_kernel::peer::Peer;
 use amaru_stores::rocksdb::RocksDbConfig;
 use clap::{ArgAction, Parser};
 use opentelemetry_sdk::metrics::SdkMeterProvider;

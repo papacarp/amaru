@@ -28,9 +28,9 @@ pub fn new_block_validator(
     let era_history: &EraHistory = network.into();
     let global_parameters: &GlobalParameters = network.into();
     let config = RocksDbConfig::new(ledger_dir);
-    let store = RocksDBHistoricalStores::new(&config, 2);
+    let store = RocksDBHistoricalStores::new(config.clone(), 2);
     let block_validator = BlockValidator::new(
-        RocksDB::new(&config)?,
+        RocksDB::new(config.clone())?,
         store,
         network,
         era_history.clone(),

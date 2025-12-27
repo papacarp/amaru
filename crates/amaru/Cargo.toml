@@ -21,8 +21,10 @@ anyhow.workspace = true
 async-compression.workspace = true
 async-trait.workspace = true
 clap.workspace = true
+flate2.workspace = true
 futures-util.workspace = true
 hex.workspace = true
+include_dir.workspace = true
 indoc.workspace = true
 minicbor.workspace = true
 opentelemetry-otlp.workspace = true
@@ -34,6 +36,7 @@ serde.workspace = true
 serde_json.workspace = true
 cbor4ii.workspace = true
 sysinfo.workspace = true
+tar.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = [
   "fs",

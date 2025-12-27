@@ -91,10 +91,11 @@ pub fn get_bootstrap_file(
 pub fn get_bootstrap_headers(
     network: NetworkName,
 ) -> Result<impl Iterator<Item = Vec<u8>>, Box<dyn Error>> {
-    let path = format!("{}/headers/*", network.to_string().to_lowercase());
+    let path = format!("{}/headers", network.to_string().to_lowercase());
     Ok(BOOTSTRAP_DIR
-        .find(&path)?
-        .filter_map(|f| f.as_file())
+        .get_dir(&path)
+        .ok_or_else(|| Box::<dyn Error>::from("headers directory not found"))?
+        .files()
         .map(|f| f.contents().into()))
 }
 

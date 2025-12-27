@@ -337,7 +337,7 @@ pub async fn import_snapshot(
         std::fs::remove_dir_all(ledger_dir.join("live"))?;
     }
 
-    let db = RocksDB::empty(&RocksDbConfig::new(ledger_dir.into()))?;
+    let db = RocksDB::empty(RocksDbConfig::new(ledger_dir.into()))?;
     let mut file = std::fs::File::open(snapshot)?;
     let dir = snapshot
         .parent()

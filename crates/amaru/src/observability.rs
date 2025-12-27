@@ -431,6 +431,31 @@ pub fn setup_observability_with_subscriber(
     Option<SdkMeterProvider>,
     Box<dyn FnOnce() -> Result<(), Box<dyn std::error::Error>>>,
 ) {
+    setup_observability_with_subscriber_and_files(
+        with_open_telemetry,
+        with_json_traces,
+        service_name,
+        span_url,
+        metric_url,
+        subscriber,
+        None,
+        None,
+    )
+}
+
+pub fn setup_observability_with_subscriber_and_files(
+    with_open_telemetry: bool,
+    with_json_traces: bool,
+    service_name: String,
+    span_url: String,
+    metric_url: String,
+    mut subscriber: TracingSubscriber<Registry>,
+    rewards_file: Option<std::path::PathBuf>,
+    snapshot_file: Option<std::path::PathBuf>,
+) -> (
+    Option<SdkMeterProvider>,
+    Box<dyn FnOnce() -> Result<(), Box<dyn std::error::Error>>>,
+) {
     let (OpenTelemetryHandle { metrics, teardown }, warning_otlp) = if with_open_telemetry {
         setup_open_telemetry(
             &OpenTelemetryConfig {
@@ -450,7 +475,11 @@ pub fn setup_observability_with_subscriber(
         None
     };
 
-    subscriber.init();
+    if let (Some(rewards), Some(snapshot)) = (rewards_file, snapshot_file) {
+        subscriber.init_with_file_loggers(Some(rewards), Some(snapshot));
+    } else {
+        subscriber.init();
+    }
 
     // NOTE: Both warnings are bound to the same ENV var, so `.or` prevents from logging it twice.
     if let Some(notify) = warning_otlp.or(warning_json) {

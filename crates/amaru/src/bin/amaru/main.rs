@@ -19,7 +19,6 @@ use amaru::panic::panic_handler;
 
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use std::sync::LazyLock;
-use tracing::info;
 
 mod cmd;
 mod pid;
@@ -141,18 +140,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // For Run command, we need to set up file loggers before initializing the subscriber
     let (metrics, teardown) = match &args.command {
         Command::Run(run_args) => {
-            let mut subscriber = observability::TracingSubscriber::new();
-            subscriber.init_with_file_loggers(
-                run_args.rewards_file.clone(),
-                run_args.snapshot_file.clone(),
-            );
-            observability::setup_observability_with_subscriber(
+            let subscriber = amaru::observability::TracingSubscriber::new();
+            amaru::observability::setup_observability_with_subscriber_and_files(
                 args.with_open_telemetry,
                 args.with_json_traces,
                 args.otlp_service_name.clone(),
                 args.otlp_span_url.clone(),
                 args.otlp_metric_url.clone(),
                 subscriber,
+                run_args.rewards_file.clone(),
+                run_args.snapshot_file.clone(),
             )
         },
         _ => {
