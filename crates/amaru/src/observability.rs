@@ -149,12 +149,12 @@ impl TracingSubscriber<Registry> {
             TracingSubscriber::Empty => unreachable!(),
             TracingSubscriber::Registry(registry) => {
                 let subscriber = registry
-                    .with(
-                        tracing_subscriber::fmt::layer()
-                            .with_writer(log_writer())
-                            .event_format(log_format())
-                            .with_span_events(log_events())
-                            .with_filter(log_filter()),
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .with_writer(log_writer())
+                        .event_format(log_format())
+                        .with_span_events(log_events())
+                        .with_filter(log_filter()),
                     );
                 match (rewards_logger, snapshot_logger) {
                     (Some(rewards), Some(snapshot)) => {
@@ -173,12 +173,12 @@ impl TracingSubscriber<Registry> {
             }
             TracingSubscriber::WithOpenTelemetry(layered) => {
                 let subscriber = layered
-                    .with(
-                        tracing_subscriber::fmt::layer()
-                            .with_writer(log_writer())
-                            .event_format(log_format())
-                            .with_span_events(log_events())
-                            .with_filter(log_filter()),
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .with_writer(log_writer())
+                        .event_format(log_format())
+                        .with_span_events(log_events())
+                        .with_filter(log_filter()),
                     );
                 match (rewards_logger, snapshot_logger) {
                     (Some(rewards), Some(snapshot)) => {

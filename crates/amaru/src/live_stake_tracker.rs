@@ -8,10 +8,18 @@ use amaru_stores::rocksdb::{ReadOnlyRocksDB, RocksDbConfig};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-/// Sum stake by pool ID from accounts and UTxO set
+/// Pool stake data including total stake and current pledge
+#[derive(Debug, Clone)]
+pub struct PoolStakeData {
+    pub stake: Lovelace,
+    pub current_pledge: Lovelace,
+}
+
+/// Sum stake by pool ID from accounts and UTxO set, and calculate current pledge
 /// 
 /// This function opens a read-only connection to the store, iterates over all accounts,
 /// initializes stake with account rewards, adds UTxO values, and sums stake by pool ID.
+/// It also calculates the current pledge for each pool (sum of owner addresses' stake).
 /// This matches the approach used in stake distribution snapshots.
 /// 
 /// **Note:** This function uses read-only database access and should not interfere with
@@ -19,8 +27,8 @@ use std::path::PathBuf;
 /// inconsistent as it reflects a point-in-time snapshot of the database state.
 pub fn calculate_stake_by_pool(
     store_path: &PathBuf,
-) -> Result<BTreeMap<PoolId, Lovelace>, StoreError> {
-    let mut stake_by_pool: BTreeMap<PoolId, Lovelace> = BTreeMap::new();
+) -> Result<BTreeMap<PoolId, PoolStakeData>, StoreError> {
+    let mut stake_by_pool: BTreeMap<PoolId, PoolStakeData> = BTreeMap::new();
     let mut stake_by_credential: BTreeMap<StakeCredential, Lovelace> = BTreeMap::new();
 
     // Open read-only connection to the store
@@ -54,11 +62,44 @@ pub fn calculate_stake_by_pool(
     }
 
     // Third pass: map credentials to pools via accounts
-    for (credential, total_stake) in stake_by_credential {
-        if let Ok(Some(account)) = db.account(&credential) {
+    for (credential, total_stake) in &stake_by_credential {
+        if let Ok(Some(account)) = db.account(credential) {
             if let Some((pool_id, _)) = account.pool {
-                *stake_by_pool.entry(pool_id).or_insert(0) += total_stake;
+                stake_by_pool
+                    .entry(pool_id)
+                    .or_insert_with(|| PoolStakeData {
+                        stake: 0,
+                        current_pledge: 0,
+                    })
+                    .stake += total_stake;
             }
+        }
+    }
+
+    // Fourth pass: calculate current pledge for each pool
+    // Current pledge = sum of stake for all owner addresses delegated to the pool
+    for (pool_id, pool_data) in stake_by_pool.iter_mut() {
+        if let Ok(Some(pool_row)) = db.pool(pool_id) {
+            let pool_params = &pool_row.current_params;
+            
+            // Sum stake for all owner addresses
+            let mut owner_stake_total = 0u64;
+            for owner_hash in &pool_params.owners {
+                let owner_credential = StakeCredential::AddrKeyhash(*owner_hash);
+                // Get stake for this owner from our already-calculated stake_by_credential map
+                if let Some(owner_stake) = stake_by_credential.get(&owner_credential) {
+                    // Verify owner is delegated to this pool
+                    if let Ok(Some(account)) = db.account(&owner_credential) {
+                        if let Some((delegated_pool_id, _)) = account.pool {
+                            if delegated_pool_id == *pool_id {
+                                owner_stake_total += owner_stake;
+                            }
+                        }
+                    }
+                }
+            }
+            
+            pool_data.current_pledge = owner_stake_total;
         }
     }
 

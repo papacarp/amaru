@@ -537,7 +537,7 @@ impl RewardsSummary {
         let influence = protocol_parameters.pledge_influence.numerator as f64 / protocol_parameters.pledge_influence.denominator as f64;
         let monetary_expansion_rate = protocol_parameters.monetary_expansion_rate.numerator as f64 / protocol_parameters.monetary_expansion_rate.denominator as f64;
         let treasury_growth_rate = protocol_parameters.treasury_expansion_rate.numerator as f64 / protocol_parameters.treasury_expansion_rate.denominator as f64;
-        
+
         info!(
             target: EVENT_TARGET,
             epoch = %stake_distribution.epoch,

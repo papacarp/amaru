@@ -2,6 +2,7 @@
 //
 // Command to calculate and display live stake by pool ID
 
+use amaru::live_stake_tracker::PoolStakeData;
 use amaru::live_stake_tracker;
 use amaru_kernel::network::NetworkName;
 use amaru_ledger::summary::serde::encode_pool_id;
@@ -68,8 +69,8 @@ pub fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-fn output_text(stake_by_pool: &BTreeMap<amaru_kernel::PoolId, u64>) -> Result<(), Box<dyn std::error::Error>> {
-    let total_stake: u64 = stake_by_pool.values().sum();
+fn output_text(stake_by_pool: &BTreeMap<amaru_kernel::PoolId, PoolStakeData>) -> Result<(), Box<dyn std::error::Error>> {
+    let total_stake: u64 = stake_by_pool.values().map(|data| data.stake).sum();
     let total_pools = stake_by_pool.len();
 
     println!("Stake Distribution Summary:");
@@ -80,35 +81,40 @@ fn output_text(stake_by_pool: &BTreeMap<amaru_kernel::PoolId, u64>) -> Result<()
     
     // Sort by stake (descending) for easier reading
     let mut sorted: Vec<_> = stake_by_pool.iter().collect();
-    sorted.sort_by(|a, b| b.1.cmp(a.1));
+    sorted.sort_by(|a, b| b.1.stake.cmp(&a.1.stake));
 
-    for (pool_id, stake) in sorted {
-        let ada = *stake as f64 / 1_000_000.0;
+    for (pool_id, pool_data) in sorted {
+        let ada = pool_data.stake as f64 / 1_000_000.0;
+        let pledge_ada = pool_data.current_pledge as f64 / 1_000_000.0;
         let pool_id_bech32 = encode_pool_id(pool_id);
-        println!("  {}: {:>20} lovelace ({:>15.2} ADA)", 
+        println!("  {}: {:>20} lovelace ({:>15.2} ADA), pledge: {:>20} lovelace ({:>15.2} ADA)", 
             pool_id_bech32,
-            stake,
-            ada
+            pool_data.stake,
+            ada,
+            pool_data.current_pledge,
+            pledge_ada
         );
     }
 
     Ok(())
 }
 
-fn output_json(stake_by_pool: &BTreeMap<amaru_kernel::PoolId, u64>) -> Result<(), Box<dyn std::error::Error>> {
+fn output_json(stake_by_pool: &BTreeMap<amaru_kernel::PoolId, PoolStakeData>) -> Result<(), Box<dyn std::error::Error>> {
     use serde_json::json;
     
-    let total_stake: u64 = stake_by_pool.values().sum();
+    let total_stake: u64 = stake_by_pool.values().map(|data| data.stake).sum();
     
     // Convert pool IDs to bech32 strings and sort by stake (descending)
     let mut pools: Vec<_> = stake_by_pool
         .iter()
-        .map(|(pool_id, stake)| {
+        .map(|(pool_id, pool_data)| {
             json!({
                 "pool_id": encode_pool_id(pool_id),
                 "pool_id_hex": hex::encode(pool_id.as_slice()),
-                "stake_lovelace": stake,
-                "stake_ada": *stake as f64 / 1_000_000.0
+                "stake_lovelace": pool_data.stake,
+                "stake_ada": pool_data.stake as f64 / 1_000_000.0,
+                "current_pledge_lovelace": pool_data.current_pledge,
+                "current_pledge_ada": pool_data.current_pledge as f64 / 1_000_000.0
             })
         })
         .collect();
