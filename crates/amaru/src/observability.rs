@@ -400,6 +400,66 @@ fn teardown_open_telemetry(
     Ok(())
 }
 
+pub fn setup_observability(
+    with_open_telemetry: bool,
+    with_json_traces: bool,
+    service_name: String,
+    span_url: String,
+    metric_url: String,
+) -> (
+    Option<SdkMeterProvider>,
+    Box<dyn FnOnce() -> Result<(), Box<dyn std::error::Error>>>,
+) {
+    setup_observability_with_subscriber(
+        with_open_telemetry,
+        with_json_traces,
+        service_name,
+        span_url,
+        metric_url,
+        TracingSubscriber::new(),
+    )
+}
+
+pub fn setup_observability_with_subscriber(
+    with_open_telemetry: bool,
+    with_json_traces: bool,
+    service_name: String,
+    span_url: String,
+    metric_url: String,
+    mut subscriber: TracingSubscriber<Registry>,
+) -> (
+    Option<SdkMeterProvider>,
+    Box<dyn FnOnce() -> Result<(), Box<dyn std::error::Error>>>,
+) {
+    let (OpenTelemetryHandle { metrics, teardown }, warning_otlp) = if with_open_telemetry {
+        setup_open_telemetry(
+            &OpenTelemetryConfig {
+                service_name,
+                span_url,
+                metric_url,
+            },
+            &mut subscriber,
+        )
+    } else {
+        (OpenTelemetryHandle::default(), None)
+    };
+
+    let warning_json = if with_json_traces {
+        setup_json_traces(&mut subscriber)
+    } else {
+        None
+    };
+
+    subscriber.init();
+
+    // NOTE: Both warnings are bound to the same ENV var, so `.or` prevents from logging it twice.
+    if let Some(notify) = warning_otlp.or(warning_json) {
+        notify();
+    }
+
+    (metrics, teardown)
+}
+
 // -----------------------------------------------------------------------------
 // ENV FILTER
 // -----------------------------------------------------------------------------
