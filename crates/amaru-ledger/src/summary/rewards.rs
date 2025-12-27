@@ -121,6 +121,7 @@ use amaru_kernel::{
     Hash, Lovelace, PoolId, StakeCredential, expect_stake_credential,
     protocol_parameters::{GlobalParameters, ProtocolParameters},
 };
+use hex;
 use amaru_slot_arithmetic::Epoch;
 use num::{
     BigUint,
@@ -261,6 +262,53 @@ impl PoolState {
             // ⌊c + (m + (1 - m) × s / σ) × (R_pool - c)⌋
             //     ⎝___ margin_factor ___⎠
             cost + floor_to_lovelace(margin_factor * BigUint::from(pool_rewards - cost))
+        }
+    }
+
+    /// Breakdown of leader rewards into operator rewards (for running the pool) and staking rewards
+    /// (for the operator's stake). This allows separating the two components that are combined
+    /// in the reward account.
+    ///
+    /// Returns (operator_rewards, staking_rewards) where:
+    /// - operator_rewards: Rewards for operating the pool (cost + margin on cost portion)
+    /// - staking_rewards: Rewards for the operator's stake (stake-proportional portion)
+    pub fn leader_rewards_breakdown(
+        &self,
+        pool_rewards: Lovelace,
+        owner_stake: Lovelace,
+        total_stake: Lovelace,
+    ) -> (Lovelace, Lovelace) {
+        let cost: Lovelace = self.parameters.cost;
+
+        if pool_rewards <= cost {
+            // All rewards go to operator (no staking component)
+            (pool_rewards, 0)
+        } else {
+            let relative_stake = self.relative_stake(total_stake);
+
+            let owner_stake_ratio = if total_stake.is_zero() {
+                LovelaceRatio::zero()
+            } else {
+                lovelace_ratio(owner_stake, total_stake)
+            };
+
+            let pool_rewards_above_cost = pool_rewards - cost;
+
+            // Operator rewards for running the pool: cost + margin × (pool_rewards - cost)
+            let operator_rewards = cost + floor_to_lovelace(
+                &self.margin * BigUint::from(pool_rewards_above_cost)
+            );
+
+            // Operator rewards for staking: (1 - m) × s / σ × (pool_rewards - cost)
+            // This is the stake-proportional portion (same formula as member_rewards)
+            let staking_rewards = floor_to_lovelace(
+                (SafeRatio::one() - &self.margin)
+                    * BigUint::from(pool_rewards_above_cost)
+                    * owner_stake_ratio
+                    / relative_stake
+            );
+
+            (operator_rewards, staking_rewards)
         }
     }
 
@@ -482,6 +530,14 @@ impl RewardsSummary {
             },
         );
 
+        // Calculate expected_blocks from epoch_length and active_slot_coeff
+        let expected_blocks = global_parameters.epoch_length as u64 / global_parameters.active_slot_coeff_inverse as u64;
+        
+        // Convert RationalNumber to f64 for influence, monetary_expansion_rate, treasury_growth_rate
+        let influence = protocol_parameters.pledge_influence.numerator as f64 / protocol_parameters.pledge_influence.denominator as f64;
+        let monetary_expansion_rate = protocol_parameters.monetary_expansion_rate.numerator as f64 / protocol_parameters.monetary_expansion_rate.denominator as f64;
+        let treasury_growth_rate = protocol_parameters.treasury_expansion_rate.numerator as f64 / protocol_parameters.treasury_expansion_rate.denominator as f64;
+
         info!(
             target: EVENT_TARGET,
             epoch = %stake_distribution.epoch,
@@ -494,6 +550,16 @@ impl RewardsSummary {
             pots.reserves = %pots.reserves,
             pots.treasury = %pots.treasury,
             pots.fees = %pots.fees,
+            expected_blocks = %expected_blocks,
+            influence = %influence,
+            max_bh_size = %protocol_parameters.max_block_header_size,
+            max_block_size = %protocol_parameters.max_block_body_size,
+            max_epoch = %protocol_parameters.stake_pool_max_retirement_epoch,
+            monetary_expansion_rate = %monetary_expansion_rate,
+            optimal_pool_count = %protocol_parameters.optimal_stake_pools_count,
+            protocol_major = %protocol_parameters.protocol_version.0,
+            protocol_minor = %protocol_parameters.protocol_version.1,
+            treasury_growth_rate = %treasury_growth_rate,
             "rewards.summary",
         );
 
@@ -586,6 +652,20 @@ impl RewardsSummary {
         if let Some(PoolRewards { pot, .. }) = pool_rewards {
             let member_rewards = pool.member_rewards(&credential, *pot, st.lovelace, total_stake);
             if member_rewards > 0 {
+                // Hook: Emit trace event for member rewards (staking rewards for delegators)
+                // Do this before moving credential into accounts map
+                let credential_hex = match &credential {
+                    StakeCredential::AddrKeyhash(hash) => hex::encode(hash.as_slice()),
+                    StakeCredential::ScriptHash(hash) => hex::encode(hash.as_slice()),
+                };
+                tracing::debug!(
+                    target: EVENT_TARGET,
+                    stake_credential_hex = %credential_hex,
+                    stake_reward = %member_rewards,
+                    leader_reward = 0u64,
+                    "rewards.account_breakdown"
+                );
+                
                 accounts
                     .entry(credential)
                     .and_modify(|rewards| *rewards += member_rewards)
@@ -625,9 +705,77 @@ impl RewardsSummary {
         );
 
         let rewards_leader = pool.leader_rewards(rewards_pot, owner_stake, total_stake);
+        
+        // Hook: Calculate and emit breakdown for operator vs staking rewards
+        // This allows external tools to track the separation without modifying core structs
+        let (rewards_operator, rewards_staking) = pool.leader_rewards_breakdown(
+            rewards_pot,
+            owner_stake,
+            total_stake,
+        );
+        tracing::debug!(
+            target: EVENT_TARGET,
+            pool_id = %encode_pool_id(&pool.parameters.id),
+            pool_id_hex = %hex::encode(pool.parameters.id.as_slice()),
+            leader_total = %rewards_leader,
+            leader_operator = %rewards_operator,
+            leader_staking = %rewards_staking,
+            owner_stake = %owner_stake,
+            total_stake = %total_stake,
+            "rewards.leader_breakdown"
+        );
+
+        // Emit individual owner stake rewards before consolidation
+        // This allows tracking individual owner rewards separately from the consolidated reward account
+        if owner_stake > 0 && rewards_staking > 0 {
+            for owner_hash in &pool.parameters.owners {
+                let owner_credential = StakeCredential::AddrKeyhash(*owner_hash);
+                if let Some(account) = stake_distribution.accounts.get(&owner_credential) {
+                    // Only include owners that are actually delegated to this pool
+                    if account.pool == Some(pool.parameters.id) {
+                        let owner_individual_stake = account.lovelace;
+                        if owner_individual_stake > 0 {
+                            // Calculate proportional stake reward for this owner
+                            // Formula: (total_staking_rewards * owner_individual_stake) / owner_stake
+                            // Use SafeRatio to avoid overflow
+                            let owner_staking_reward = floor_to_lovelace(
+                                SafeRatio::from_integer(BigUint::from(rewards_staking))
+                                    * BigUint::from(owner_individual_stake)
+                                    / BigUint::from(owner_stake)
+                            );
+                            
+                            let owner_hex = hex::encode(owner_hash.as_slice());
+                            tracing::debug!(
+                                target: EVENT_TARGET,
+                                epoch = %stake_distribution.epoch,
+                                stake_credential_hex = %owner_hex,
+                                leader_reward = 0u64,
+                                stake_reward = %owner_staking_reward,
+                                "rewards.account_breakdown"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        let reward_account = expect_stake_credential(&pool.parameters.reward_account);
+        let reward_account_hex = match &reward_account {
+            StakeCredential::AddrKeyhash(hash) => hex::encode(hash.as_slice()),
+            StakeCredential::ScriptHash(hash) => hex::encode(hash.as_slice()),
+        };
+        
+        tracing::debug!(
+            target: EVENT_TARGET,
+            epoch = %stake_distribution.epoch,
+            stake_credential_hex = %reward_account_hex,
+            leader_reward = %rewards_operator,
+            stake_reward = %rewards_staking,
+            "rewards.account_breakdown"
+        );
 
         accounts
-            .entry(expect_stake_credential(&pool.parameters.reward_account))
+            .entry(reward_account)
             .and_modify(|rewards| *rewards += rewards_leader)
             .or_insert(rewards_leader);
 

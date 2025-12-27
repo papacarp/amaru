@@ -57,3 +57,18 @@ crates/amaru-ledger/tests/data/rules-conformance
 
 # Test arguments, generated data and traces created during the simulation
 simulation/amaru-sim/test-data/
+
+# Pooltool development files
+rewards_data_*.csv
+rewards_data_summary_*.json
+delegator_rewards_*.json
+delegator_rewards_*.txt
+extract*.py
+__pycache__/
+venv/
+live_stake_data/
+snapshot_file*.cbor
+*.txt
+REWARDS_*.md
+SNAPSHOT_*.md
+STAKE_*.md

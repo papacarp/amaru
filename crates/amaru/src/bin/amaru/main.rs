@@ -12,16 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use amaru::observability;
 use amaru::observability::{
-    DEFAULT_OTLP_METRIC_URL, DEFAULT_OTLP_SERVICE_NAME, DEFAULT_OTLP_SPAN_URL, setup_observability,
+    DEFAULT_OTLP_METRIC_URL, DEFAULT_OTLP_SERVICE_NAME, DEFAULT_OTLP_SPAN_URL,
 };
-use amaru::panic::panic_handler;
 
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
+use observability::OpenTelemetryConfig;
+use panic::panic_handler;
 use std::sync::LazyLock;
 use tracing::info;
 
 mod cmd;
+mod metrics;
+mod panic;
 mod pid;
 
 mod built_info {
@@ -56,7 +60,6 @@ enum Command {
     FetchChainHeaders(cmd::fetch_chain_headers::Args),
 
     /// Run the node in all its glory.
-    #[command(alias = "daemon")]
     Run(cmd::run::Args),
 
     /// Import the ledger state from a CBOR export produced by a Haskell node.
@@ -76,7 +79,7 @@ enum Command {
     /// * The`Nonces` from the `HeaderState` which are written to a `nonces.json` file.
     ConvertLedgerState(cmd::convert_ledger_state::Args),
 
-    /// Import block headers
+    /// Import block headers from `${config_dir}/${network name}/`
     #[clap(alias = "import-chain-db")]
     ImportHeaders(cmd::import_headers::Args),
 
@@ -97,6 +100,10 @@ enum Command {
     /// This command is only relevant when one upgrades Amaru to a newer version that
     /// requires changes in the database format.
     MigrateChainDB(cmd::migrate_chain_db::Args),
+
+    /// Calculate and display current stake distribution by pool ID.
+    /// This reads from the ledger database and can be run independently of the running node.
+    StakeSummary(cmd::stake_summary::Args),
 }
 
 #[derive(Debug, Parser)]
@@ -135,6 +142,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .get_matches();
     let args = <Cli as FromArgMatches>::from_arg_matches(&matches)?;
 
+    let mut subscriber = observability::TracingSubscriber::new();
+
+    let (observability::OpenTelemetryHandle { metrics, teardown }, warning_otlp) =
+        if args.with_open_telemetry {
+            observability::setup_open_telemetry(
+                &OpenTelemetryConfig {
+                    service_name: args.otlp_service_name.clone(),
+                    span_url: args.otlp_span_url.clone(),
+                    metric_url: args.otlp_metric_url.clone(),
+                },
+                &mut subscriber,
+            )
+        } else {
+            (observability::OpenTelemetryHandle::default(), None)
+        };
+
+    let warning_json = if args.with_json_traces {
+        observability::setup_json_traces(&mut subscriber)
+    } else {
+        None
+    };
+
+    // NOTE: Both warnings are bound to the same ENV var, so `.or` prevents from logging it twice.
+    if let Some(notify) = warning_otlp.or(warning_json) {
+        notify();
+    }
+
     info!(
         with_open_telemetry = args.with_open_telemetry,
         with_json_traces = args.with_json_traces,
@@ -144,16 +178,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Started with global arguments"
     );
 
-    let (metrics, teardown) = setup_observability(
-        args.with_open_telemetry,
-        args.with_json_traces,
-        args.otlp_service_name,
-        args.otlp_span_url,
-        args.otlp_metric_url,
-    );
-
     let result = match args.command {
-        Command::Run(args) => cmd::run::run(args, metrics).await,
+        Command::Run(run_args) => {
+            subscriber.init_with_file_loggers(
+                run_args.rewards_file.clone(),
+                run_args.snapshot_file.clone(),
+            );
+            cmd::run::run(run_args, metrics).await
+        },
         Command::ImportLedgerState(args) => cmd::import_ledger_state::run(args).await,
         Command::ImportHeaders(args) => cmd::import_headers::run(args).await,
         Command::ImportNonces(args) => cmd::import_nonces::run(args).await,
@@ -162,6 +194,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::ConvertLedgerState(args) => cmd::convert_ledger_state::run(args).await,
         Command::DumpChainDB(args) => cmd::dump_chain_db::run(args).await,
         Command::MigrateChainDB(args) => cmd::migrate_chain_db::run(args).await,
+        Command::StakeSummary(args) => {
+            cmd::stake_summary::run(args).map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())) as Box<dyn std::error::Error>)
+        },
     };
 
     // TODO: we might also want to integrate this into a graceful shutdown system, and into a panic hook

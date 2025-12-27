@@ -27,9 +27,19 @@ use amaru_kernel::{
     output_stake_credential, protocol_parameters::ProtocolParameters,
 };
 use amaru_slot_arithmetic::Epoch;
+use hex;
 use serde::ser::SerializeStruct;
+use serde_json;
 use std::collections::BTreeMap;
 use tracing::info;
+
+// Helper struct for serializing accounts with lovelace and delegation info
+#[derive(serde::Serialize)]
+struct AccountLovelaceOnly {
+    lovelace: Lovelace,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pool: Option<String>, // Hex-encoded pool ID if delegated
+}
 
 const EVENT_TARGET: &str = "amaru::ledger::state::stake_distribution";
 
@@ -286,6 +296,28 @@ impl StakeDistribution {
                 .and_modify(|pool| pool.blocks_count += 1);
         });
 
+        // Serialize accounts with lovelace and delegation info
+        let accounts_json: BTreeMap<String, AccountLovelaceOnly> = accounts
+            .iter()
+            .map(|(credential, account)| {
+                let credential_hex = match credential {
+                    StakeCredential::AddrKeyhash(hash) => hex::encode(hash.as_slice()),
+                    StakeCredential::ScriptHash(hash) => hex::encode(hash.as_slice()),
+                };
+                let pool_hex = account.pool.as_ref().map(|pool_id| hex::encode(pool_id));
+                (credential_hex, AccountLovelaceOnly { 
+                    lovelace: account.lovelace,
+                    pool: pool_hex,
+                })
+            })
+            .collect();
+        
+        let accounts_json_str = serde_json::to_string(&accounts_json)
+            .unwrap_or_else(|_| "{}".to_string());
+        
+        let pools_json_str = serde_json::to_string(&pools)
+            .unwrap_or_else(|_| "{}".to_string());
+
         info!(
             target: EVENT_TARGET,
             epoch = %epoch,
@@ -295,6 +327,8 @@ impl StakeDistribution {
             dreps = %dreps.len(),
             dreps_voting_stake = %dreps_voting_stake,
             pools_voting_stake = %pools_voting_stake,
+            accounts_json = %accounts_json_str,
+            pools_json = %pools_json_str,
             "stake_distribution.snapshot",
         );
 

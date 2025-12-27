@@ -12,14 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::cmd::default_chain_dir;
 use crate::pid::with_optional_pid_file;
-use amaru::metrics::track_system_metrics;
-use amaru::stages::{Config, MaxExtraLedgerSnapshots, StoreType, build_and_run_network};
-use amaru::{
-    DEFAULT_LISTEN_ADDRESS, DEFAULT_NETWORK, DEFAULT_PEER_ADDRESS, default_chain_dir,
-    default_ledger_dir,
-};
+use crate::{cmd::default_ledger_dir, metrics::track_system_metrics};
+use amaru::stages::{Config, MaxExtraLedgerSnapshots, StoreType, bootstrap};
 use amaru_kernel::network::NetworkName;
+use amaru_kernel::peer::Peer;
 use amaru_stores::rocksdb::RocksDbConfig;
 use clap::{ArgAction, Parser};
 use opentelemetry_sdk::metrics::SdkMeterProvider;
@@ -33,7 +31,7 @@ pub struct Args {
     ///
     /// This option can be specified multiple times to connect to multiple peers.
     /// At least one peer address must be specified.
-    #[arg(long, value_name = "NETWORK_ADDRESS", default_value = DEFAULT_PEER_ADDRESS, env = "AMARU_PEER_ADDRESS",
+    #[arg(long, value_name = "NETWORK_ADDRESS", default_value = super::DEFAULT_PEER_ADDRESS, env = "AMARU_PEER_ADDRESS",
         action = ArgAction::Append, required = true, value_delimiter = ',')]
     peer_address: Vec<String>,
 
@@ -45,7 +43,7 @@ pub struct Args {
         long,
         value_name = "NETWORK",
         env = "AMARU_NETWORK",
-        default_value_t = DEFAULT_NETWORK,
+        default_value_t = super::DEFAULT_NETWORK,
     )]
     network: NetworkName,
 
@@ -58,7 +56,7 @@ pub struct Args {
     chain_dir: Option<PathBuf>,
 
     /// The address to listen on for incoming connections.
-    #[arg(long, value_name = "NETWORK_ADDRESS", env = "AMARU_LISTEN_ADDRESS", default_value = DEFAULT_LISTEN_ADDRESS
+    #[arg(long, value_name = "NETWORK_ADDRESS", env = "AMARU_LISTEN_ADDRESS", default_value = super::DEFAULT_LISTEN_ADDRESS
     )]
     listen_address: String,
 
@@ -92,6 +90,12 @@ pub struct Args {
     /// By default, the migration is not performed automatically, checkout `migrate-chain-db` command.
     #[arg(long, action = ArgAction::SetTrue, default_value_t = false, env = "AMARU_MIGRATE_CHAIN_DB")]
     migrate_chain_db: bool,
+
+    #[arg(long, value_name = "BASE_PATH", env = "AMARU_REWARDS_FILE")]
+    pub rewards_file: Option<PathBuf>,
+    
+    #[arg(long, value_name = "BASE_PATH", env = "AMARU_SNAPSHOT_FILE")]
+    pub snapshot_file: Option<PathBuf>,
 }
 
 pub async fn run(
@@ -107,11 +111,11 @@ pub async fn run(
             .map(track_system_metrics)
             .transpose()?;
 
+        let peers = config.upstream_peers.iter().map(|p| Peer::new(p)).collect();
+
         let exit = amaru::exit::hook_exit_token();
 
-        let _ = build_and_run_network(config, meter_provider).await?;
-
-        exit.cancelled().await;
+        bootstrap(config, peers, exit, meter_provider).await?;
 
         if let Some(handle) = metrics {
             handle.abort();
