@@ -344,9 +344,9 @@ fn make_ledger(
         }
         StoreType::RocksDb(rocks_db_config) => {
             let ledger = BlockValidator::new(
-                RocksDB::new(rocks_db_config)?,
+                RocksDB::new(rocks_db_config.clone())?,
                 RocksDBHistoricalStores::new(
-                    rocks_db_config,
+                    rocks_db_config.clone(),
                     u64::from(config.max_extra_ledger_snapshots),
                 ),
                 network,
