@@ -104,6 +104,15 @@ enum Command {
     /// Calculate and display current stake distribution by pool ID.
     /// This reads from the ledger database and can be run independently of the running node.
     StakeSummary(cmd::stake_summary::Args),
+
+    /// Output detailed live stake data including delegator lists for each pool.
+    /// This reads from the ledger database and can be run independently of the running node.
+    /// Outputs JSON format suitable for pickling in the legacy format.
+    LiveStakeDetailed(cmd::live_stake_detailed::Args),
+
+    /// Display the current epoch and slot from the chain tip.
+    /// This reads from the chain database and can be run independently of the running node.
+    Tip(cmd::tip::Args),
 }
 
 #[derive(Debug, Parser)]
@@ -196,6 +205,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::MigrateChainDB(args) => cmd::migrate_chain_db::run(args).await,
         Command::StakeSummary(args) => {
             cmd::stake_summary::run(args).map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())) as Box<dyn std::error::Error>)
+        },
+        Command::LiveStakeDetailed(args) => {
+            cmd::live_stake_detailed::run(args).map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())) as Box<dyn std::error::Error>)
+        },
+        Command::Tip(args) => {
+            cmd::tip::run(args).map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())) as Box<dyn std::error::Error>)
         },
     };
 
