@@ -40,6 +40,9 @@
 
 #![expect(unused)]
 
+use std::sync::Arc;
+
+use amaru_observability::trace_span;
 use cbor4ii::{
     core::{
         enc::{Encode, Write},
@@ -48,7 +51,6 @@ use cbor4ii::{
     serde::{from_slice, to_writer},
 };
 use parking_lot::Mutex;
-use std::sync::Arc;
 use tracing::{Event, Subscriber};
 use tracing_subscriber::layer::{Context, Layer};
 
@@ -118,11 +120,7 @@ impl tracing::field::Visit for CborVisitor {
         self.add_field(field.name(), value.to_vec());
     }
 
-    fn record_error(
-        &mut self,
-        field: &tracing::field::Field,
-        value: &(dyn std::error::Error + 'static),
-    ) {
+    fn record_error(&mut self, field: &tracing::field::Field, value: &(dyn std::error::Error + 'static)) {
         let mut buf = Vec::new();
         to_writer(&mut buf, &format!("{}", value)).unwrap();
         self.add_field(field.name(), buf);
@@ -149,12 +147,7 @@ impl<S> Layer<S> for CborLayer
 where
     S: Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
 {
-    fn on_new_span(
-        &self,
-        attrs: &tracing::span::Attributes<'_>,
-        id: &tracing::span::Id,
-        ctx: Context<'_, S>,
-    ) {
+    fn on_new_span(&self, attrs: &tracing::span::Attributes<'_>, id: &tracing::span::Id, ctx: Context<'_, S>) {
         let mut visitor = CborVisitor::default();
         attrs.record(&mut visitor);
 
@@ -173,24 +166,16 @@ where
             let mut span_cbor = Vec::new();
             let mut writer = IoWriter::new(&mut span_cbor);
 
-            cbor4ii::core::types::Map::bounded(
-                1 + fields.map(|x| x.len()).unwrap_or_default(),
-                &mut writer,
-            )
-            .expect("serialization should not fail");
+            cbor4ii::core::types::Map::bounded(1 + fields.map(|x| x.len()).unwrap_or_default(), &mut writer)
+                .expect("serialization should not fail");
 
             // Add span name
-            "span_enter"
-                .encode(&mut writer)
-                .expect("serialization should not fail");
-            span.name()
-                .encode(&mut writer)
-                .expect("serialization should not fail");
+            "span_enter".encode(&mut writer).expect("serialization should not fail");
+            span.name().encode(&mut writer).expect("serialization should not fail");
 
             if let Some(fields) = fields {
                 for (key, value) in fields {
-                    key.encode(&mut writer)
-                        .expect("serialization should not fail");
+                    key.encode(&mut writer).expect("serialization should not fail");
                     writer.push(value).expect("serialization should not fail");
                 }
             }
@@ -207,12 +192,10 @@ where
         let mut event_cbor = Vec::new();
         let mut writer = IoWriter::new(&mut event_cbor);
 
-        cbor4ii::core::types::Map::bounded(visitor.fields.len(), &mut writer)
-            .expect("serialization should not fail");
+        cbor4ii::core::types::Map::bounded(visitor.fields.len(), &mut writer).expect("serialization should not fail");
 
         for (key, value) in visitor.fields {
-            key.encode(&mut writer)
-                .expect("serialization should not fail");
+            key.encode(&mut writer).expect("serialization should not fail");
             writer.push(&value).expect("serialization should not fail");
         }
 
@@ -229,10 +212,12 @@ impl CborEmitter for Arc<Mutex<Vec<u8>>> {
 #[expect(clippy::disallowed_types)]
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::{collections::HashMap, mem::take};
+
     use tracing::{info, info_span};
     use tracing_subscriber::layer::SubscriberExt;
+
+    use super::*;
 
     #[test]
     fn fix_representation() {
@@ -295,7 +280,8 @@ mod tests {
             tracing_subscriber::registry().with(CborLayer::new(collector.clone())),
         ));
 
-        info_span!("test_span", field1 = 42, field2 = "value").in_scope(|| {
+        // Use tracing::trace_span! directly since we don't have a schema defined for this test
+        tracing::trace_span!("test_span", field1 = 42, field2 = "value").in_scope(|| {
             info!(message = "test event", field3 = 123);
         });
 
@@ -303,15 +289,13 @@ mod tests {
         let mut reader = std::io::Cursor::new(traces);
 
         // Verify span
-        let span: HashMap<String, cbor4ii::core::Value> =
-            cbor4ii::serde::from_reader(&mut reader).unwrap();
+        let span: HashMap<String, cbor4ii::core::Value> = cbor4ii::serde::from_reader(&mut reader).unwrap();
         assert!(span.iter().any(|(key, _)| key == "span_enter"));
         assert!(span.iter().any(|(key, _)| key == "field1"));
         assert!(span.iter().any(|(key, _)| key == "field2"));
 
         // Verify event
-        let event: HashMap<String, cbor4ii::core::Value> =
-            cbor4ii::serde::from_reader(&mut reader).unwrap();
+        let event: HashMap<String, cbor4ii::core::Value> = cbor4ii::serde::from_reader(&mut reader).unwrap();
         assert!(event.iter().any(|(key, _)| key == "message"));
         assert!(event.iter().any(|(key, _)| key == "field3"));
     }

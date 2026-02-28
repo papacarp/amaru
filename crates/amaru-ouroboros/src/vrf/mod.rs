@@ -16,11 +16,10 @@
 //!
 //! <https://datatracker.ietf.org/doc/html/draft-irtf-cfrg-vrf-03>
 
-use amaru_slot_arithmetic::Slot;
-pub use pallas_primitives::babbage::{VrfDerivation as Derivation, derive_tagged_vrf_output};
 use std::{array::TryFromSliceError, ops::Deref};
 
-use crate::{Hash, Hasher};
+use amaru_kernel::{Hash, Hasher, Slot};
+pub use pallas_primitives::babbage::{VrfDerivation as Derivation, derive_tagged_vrf_output};
 use thiserror::Error;
 use vrf_dalek::{
     errors::VrfError,
@@ -179,11 +178,7 @@ impl Proof {
     /// Verify a proof signature with a vrf public key. This will return a hash to compare with the original
     /// signature hash, but any non-error result is considered a successful verification without needing
     /// to do the extra comparison check.
-    pub fn verify(
-        &self,
-        public_key: &PublicKey,
-        input: &Input,
-    ) -> Result<Hash<{ Self::HASH_SIZE }>, ProofVerifyError> {
+    pub fn verify(&self, public_key: &PublicKey, input: &Input) -> Result<Hash<{ Self::HASH_SIZE }>, ProofVerifyError> {
         Ok(Hash::from(self.0.verify(&public_key.0, input.as_ref())?))
     }
 }
@@ -199,14 +194,10 @@ impl TryFrom<&[u8; Self::SIZE]> for Proof {
 
     #[expect(clippy::wildcard_enum_match_arm)]
     fn try_from(slice: &[u8; Self::SIZE]) -> Result<Self, Self::Error> {
-        Ok(Proof(VrfProof03::from_bytes(slice).map_err(
-            |e| match e {
-                VrfError::DecompressionFailed => ProofFromBytesError::DecompressionFailed,
-                _ => unreachable!(
-                    "Other error than decompression failure found when deserialising proof: {e:?}"
-                ),
-            },
-        )?))
+        Ok(Proof(VrfProof03::from_bytes(slice).map_err(|e| match e {
+            VrfError::DecompressionFailed => ProofFromBytesError::DecompressionFailed,
+            _ => unreachable!("Other error than decompression failure found when deserialising proof: {e:?}"),
+        })?))
     }
 }
 
@@ -224,8 +215,8 @@ impl From<&Proof> for Hash<{ Proof::HASH_SIZE }> {
 
 // ---------------------------------------------------------------------- Errors
 
-/// error that can be returned if the verification of a [`VrfProof`] fails
-/// see [`VrfProof::verify`]
+/// error that can be returned if the verification of a [`VrfProof03`] fails
+/// see [`VrfProof03::verify`]
 #[derive(Error, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[error("VRF proof verification failed: {:?}", .0)]
 pub struct ProofVerifyError(
@@ -248,9 +239,9 @@ mod serde_remote {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     use proptest::prelude::*;
+
+    use super::*;
 
     // Necessary to avoid defining a 'Debug' instance on SecretKey that would be leaky. It's only
     // needed for test, so appears here.

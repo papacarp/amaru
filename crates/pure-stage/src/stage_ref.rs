@@ -12,8 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::Name;
-use std::{fmt, marker::PhantomData, ops::Deref};
+use std::{any::Any, fmt, marker::PhantomData, ops::Deref, sync::Arc};
+
+use crate::{BLACKHOLE_NAME, Name};
 
 /// A handle to a stage during the building phase of a [`StageGraph`](crate::StageGraph).
 pub struct StageBuildRef<Msg, St, RefAux> {
@@ -25,10 +26,7 @@ pub struct StageBuildRef<Msg, St, RefAux> {
 impl<Msg, State, RefAux> StageBuildRef<Msg, State, RefAux> {
     /// Derive the handle that can later be used for sending messages to this stage.
     pub fn sender(&self) -> StageRef<Msg> {
-        StageRef {
-            name: self.name.clone(),
-            _ph: PhantomData,
-        }
+        StageRef { name: self.name.clone(), extra: None, _ph: PhantomData }
     }
 }
 
@@ -37,7 +35,9 @@ impl<Msg, State, RefAux> StageBuildRef<Msg, State, RefAux> {
 pub struct StageRef<Msg> {
     name: Name,
     #[serde(skip)]
-    pub(crate) _ph: PhantomData<Msg>,
+    extra: Option<Arc<dyn Any + Send + Sync>>,
+    #[serde(skip)]
+    _ph: PhantomData<Msg>,
 }
 
 impl<Msg> PartialEq for StageRef<Msg> {
@@ -46,20 +46,17 @@ impl<Msg> PartialEq for StageRef<Msg> {
     }
 }
 
+impl<Msg> Eq for StageRef<Msg> {}
+
 impl<Msg> Clone for StageRef<Msg> {
     fn clone(&self) -> Self {
-        Self {
-            name: self.name.clone(),
-            _ph: PhantomData,
-        }
+        Self { name: self.name.clone(), extra: self.extra.clone(), _ph: PhantomData }
     }
 }
 
 impl<Msg> fmt::Debug for StageRef<Msg> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("StageRef")
-            .field("name", &self.name)
-            .finish()
+        write!(f, "StageRef({})", self.name)
     }
 }
 
@@ -69,20 +66,41 @@ impl<Msg> AsRef<StageRef<Msg>> for StageRef<Msg> {
     }
 }
 
+impl<Msg> AsRef<Name> for StageRef<Msg> {
+    fn as_ref(&self) -> &Name {
+        &self.name
+    }
+}
+
+impl<Msg> AsRef<str> for StageRef<Msg> {
+    fn as_ref(&self) -> &str {
+        self.name.as_str()
+    }
+}
+
 impl<Msg> StageRef<Msg> {
     pub(crate) fn new(name: Name) -> Self {
-        Self {
-            name,
-            _ph: PhantomData,
-        }
+        Self { name, extra: None, _ph: PhantomData }
     }
 
-    pub fn named(name: &str) -> StageRef<Msg> {
+    pub(crate) fn with_extra(self, extra: Arc<dyn Any + Send + Sync>) -> Self {
+        Self { extra: Some(extra), ..self }
+    }
+
+    pub fn named_for_tests(name: &str) -> StageRef<Msg> {
         StageRef::new(Name::from(name))
+    }
+
+    pub fn blackhole() -> StageRef<Msg> {
+        StageRef::new(BLACKHOLE_NAME.clone())
     }
 
     pub fn name(&self) -> &Name {
         &self.name
+    }
+
+    pub(crate) fn extra(&self) -> Option<&Arc<dyn Any + Send + Sync>> {
+        self.extra.as_ref()
     }
 }
 
@@ -98,19 +116,13 @@ pub struct StageStateRef<Msg, St> {
 
 impl<Msg, St> Clone for StageStateRef<Msg, St> {
     fn clone(&self) -> Self {
-        Self {
-            stage_ref: self.stage_ref.clone(),
-            _ph: self._ph,
-        }
+        Self { stage_ref: self.stage_ref.clone(), _ph: self._ph }
     }
 }
 
 impl<Msg, St> StageStateRef<Msg, St> {
     pub(crate) fn new(name: Name) -> Self {
-        Self {
-            stage_ref: StageRef::new(name),
-            _ph: PhantomData,
-        }
+        Self { stage_ref: StageRef::new(name), _ph: PhantomData }
     }
 }
 
@@ -142,10 +154,7 @@ impl<Msg, St> AsRef<StageRef<Msg>> for StageStateRef<Msg, St> {
 
 #[test]
 fn stage_ref() {
-    let stage = StageRef {
-        name: "test".into(),
-        _ph: PhantomData::<(u32, u64)>,
-    };
+    let stage = StageRef { name: "test".into(), extra: None, _ph: PhantomData::<(u32, u64)> };
 
     fn send<T: Send>(_t: &T) {}
     fn sync<T: Sync>(_t: &T) {}

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use amaru_kernel::{ExUnits, protocol_parameters::ProtocolParameters, sum_ex_units};
+use amaru_kernel::{ExUnits, ProtocolParameters, sum_ex_units};
 
 use super::InvalidBlockDetails;
 
@@ -23,9 +23,7 @@ pub fn block_ex_units_valid(
     // TODO: rewrite this to use iterators defined on `Redeemers` and `MaybeIndefArray`, ideally
 
     let pp_max_ex_units = protocol_parameters.max_block_ex_units;
-    let ex_units = ex_units
-        .into_iter()
-        .fold(ExUnits { mem: 0, steps: 0 }, sum_ex_units);
+    let ex_units = ex_units.into_iter().fold(ExUnits { mem: 0, steps: 0 }, sum_ex_units);
 
     if ex_units.mem <= pp_max_ex_units.mem && ex_units.steps <= pp_max_ex_units.steps {
         return Ok(());
@@ -33,33 +31,26 @@ pub fn block_ex_units_valid(
 
     Err(InvalidBlockDetails::TooManyExUnits {
         provided: ex_units,
-        max: ExUnits {
-            mem: pp_max_ex_units.mem,
-            steps: pp_max_ex_units.steps,
-        },
+        max: ExUnits { mem: pp_max_ex_units.mem, steps: pp_max_ex_units.steps },
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::rules::block::InvalidBlockDetails;
-    use amaru_kernel::{
-        ExUnits, HasExUnits, MintedBlock, include_cbor, protocol_parameters::ProtocolParameters,
-    };
+    use amaru_kernel::{Block, ExUnits, HasExUnits, ProtocolParameters, include_cbor};
     use test_case::test_case;
+
+    use crate::rules::block::InvalidBlockDetails;
 
     macro_rules! fixture {
         ($number:literal) => {
             (
                 include_cbor!(concat!("blocks/preprod/", $number, "/valid.cbor")),
-                amaru_kernel::protocol_parameters::PREPROD_INITIAL_PROTOCOL_PARAMETERS.clone(),
+                amaru_kernel::PREPROD_INITIAL_PROTOCOL_PARAMETERS.clone(),
             )
         };
         ($number:literal, $pp:expr) => {
-            (
-                include_cbor!(concat!("blocks/preprod/", $number, "/valid.cbor")),
-                $pp,
-            )
+            (include_cbor!(concat!("blocks/preprod/", $number, "/valid.cbor")), $pp)
         };
     }
 
@@ -69,12 +60,10 @@ mod tests {
             mem: 0,
             steps: 0
         },
-        ..amaru_kernel::protocol_parameters::PREPROD_INITIAL_PROTOCOL_PARAMETERS.clone()
+        ..amaru_kernel::PREPROD_INITIAL_PROTOCOL_PARAMETERS.clone()
     }) => matches Err(InvalidBlockDetails::TooManyExUnits{provided, max: _})
     if provided == ExUnits {mem: 1267029, steps: 289959162}; "invalid ex units")]
-    fn test_ex_units(
-        (block, protocol_parameters): (MintedBlock<'_>, ProtocolParameters),
-    ) -> Result<(), InvalidBlockDetails> {
+    fn test_ex_units((block, protocol_parameters): (Block, ProtocolParameters)) -> Result<(), InvalidBlockDetails> {
         super::block_ex_units_valid(block.ex_units(), &protocol_parameters)
     }
 }

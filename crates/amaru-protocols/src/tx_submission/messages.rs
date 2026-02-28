@@ -1,0 +1,342 @@
+// Copyright 2025 PRAGMA
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use std::fmt::Display;
+
+use amaru_kernel::{NonEmptyBytes, Transaction, cbor, to_cbor};
+use amaru_ouroboros_traits::TxId;
+
+use crate::tx_submission::Blocking;
+
+/// Messages for the txsubmission mini-protocol.
+#[derive(Debug, PartialEq, Eq, Clone, serde::Serialize, serde::Deserialize)]
+#[repr(u8)]
+pub enum Message {
+    Init,
+    RequestTxIdsBlocking(u16, u16),
+    RequestTxIdsNonBlocking(u16, u16),
+    RequestTxs(Vec<TxId>),
+    ReplyTxIds(Vec<(TxId, u32)>),
+    ReplyTxs(Vec<Transaction>),
+    Done,
+}
+
+impl Message {
+    /// This is copied from the `std::mem` docs, it is the official way.
+    fn discriminant(&self) -> u8 {
+        // SAFETY: Because `Self` is marked `repr(u8)`, its layout is a `repr(C)` `union`
+        // between `repr(C)` structs, each of which has the `u8` discriminant as its first
+        // field, so we can read the discriminant without offsetting the pointer.
+        unsafe { *<*const _>::from(self).cast::<u8>() }
+    }
+}
+
+impl PartialOrd for Message {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Message {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.discriminant().cmp(&other.discriminant()).then_with(|| match (self, other) {
+            (Message::Init, Message::Init) => std::cmp::Ordering::Equal,
+            (Message::RequestTxIdsBlocking(a1, b1), Message::RequestTxIdsBlocking(a2, b2)) => {
+                a1.cmp(a2).then_with(|| b1.cmp(b2))
+            }
+            (Message::RequestTxIdsNonBlocking(a1, b1), Message::RequestTxIdsNonBlocking(a2, b2)) => {
+                a1.cmp(a2).then_with(|| b1.cmp(b2))
+            }
+            (Message::RequestTxs(a1), Message::RequestTxs(a2)) => a1.cmp(a2),
+            (Message::ReplyTxIds(a1), Message::ReplyTxIds(a2)) => a1.cmp(a2),
+            (Message::ReplyTxs(a1), Message::ReplyTxs(a2)) => {
+                let left = to_cbor(a1);
+                let right = to_cbor(a2);
+                left.cmp(&right)
+            }
+            (Message::Done, Message::Done) => std::cmp::Ordering::Equal,
+            _ => unreachable!(),
+        })
+    }
+}
+
+impl Message {
+    pub fn message_type(&self) -> &'static str {
+        match self {
+            Message::Init => "Init",
+            Message::RequestTxIdsBlocking(_, _) => "RequestTxIdsBlocking",
+            Message::RequestTxIdsNonBlocking(_, _) => "RequestTxIdsNonBlocking",
+            Message::ReplyTxIds(_) => "ReplyTxIds",
+            Message::RequestTxs(_) => "RequestTxs",
+            Message::ReplyTxs(_) => "ReplyTxs",
+            Message::Done => "Done",
+        }
+    }
+}
+
+impl cbor::Encode<()> for Message {
+    fn encode<W: cbor::encode::Write>(
+        &self,
+        e: &mut cbor::Encoder<W>,
+        _ctx: &mut (),
+    ) -> Result<(), cbor::encode::Error<W::Error>> {
+        match self {
+            Message::RequestTxIdsBlocking(ack, req) => {
+                e.array(4)?.u16(0)?;
+                e.encode(Blocking::Yes)?;
+                e.u16(*ack)?;
+                e.u16(*req)?;
+            }
+            Message::RequestTxIdsNonBlocking(ack, req) => {
+                e.array(4)?.u16(0)?;
+                e.encode(Blocking::No)?;
+                e.u16(*ack)?;
+                e.u16(*req)?;
+            }
+            Message::ReplyTxIds(ids) => {
+                e.array(2)?.u16(1)?;
+                e.begin_array()?;
+                for id in ids {
+                    e.encode(id)?;
+                }
+                e.end()?;
+            }
+            Message::RequestTxs(ids) => {
+                e.array(2)?.u16(2)?;
+                e.array(ids.len() as u64)?;
+                for id in ids {
+                    e.encode(id)?;
+                }
+            }
+            Message::ReplyTxs(txs) => {
+                e.array(2)?.u16(3)?;
+                e.array(txs.len() as u64)?;
+                for tx in txs {
+                    e.encode(tx)?;
+                }
+            }
+            Message::Done => {
+                e.array(1)?.u16(4)?;
+            }
+            Message::Init => {
+                e.array(1)?.u16(6)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<'b> cbor::Decode<'b, ()> for Message {
+    fn decode(d: &mut cbor::Decoder<'b>, _ctx: &mut ()) -> Result<Self, cbor::decode::Error> {
+        let len = d.array()?;
+        let label = d.u16()?;
+
+        match label {
+            0 => {
+                cbor::check_tagged_array_length(0, len, 4)?;
+                let blocking = d.decode()?;
+                let ack = d.u16()?;
+                let req = d.u16()?;
+                match blocking {
+                    Blocking::Yes => Ok(Message::RequestTxIdsBlocking(ack, req)),
+                    Blocking::No => Ok(Message::RequestTxIdsNonBlocking(ack, req)),
+                }
+            }
+            1 => {
+                cbor::check_tagged_array_length(1, len, 2)?;
+                let items = d.decode()?;
+                Ok(Message::ReplyTxIds(items))
+            }
+            2 => {
+                cbor::check_tagged_array_length(2, len, 2)?;
+                let ids = d.decode()?;
+                Ok(Message::RequestTxs(ids))
+            }
+            3 => {
+                cbor::check_tagged_array_length(3, len, 2)?;
+                Ok(Message::ReplyTxs(d.array_iter()?.collect::<Result<_, _>>()?))
+            }
+            4 => {
+                cbor::check_tagged_array_length(4, len, 1)?;
+                Ok(Message::Done)
+            }
+            6 => {
+                cbor::check_tagged_array_length(6, len, 1)?;
+                Ok(Message::Init)
+            }
+            _ => Err(cbor::decode::Error::message("unknown variant for txsubmission message")),
+        }
+    }
+}
+
+impl Display for Message {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Message::Init => write!(f, "Init"),
+            Message::RequestTxIdsBlocking(ack, req) => {
+                write!(f, "RequestTxIdsBlocking(ack: {}, req: {})", ack, req,)
+            }
+            Message::RequestTxIdsNonBlocking(ack, req) => {
+                write!(f, "RequestTxIdsNonBlocking(ack: {}, req: {})", ack, req,)
+            }
+            Message::ReplyTxIds(ids) => {
+                write!(
+                    f,
+                    "ReplyTxIds(ids: [{}])",
+                    ids.iter().map(|(id, size)| format!("({}, {})", id, size)).collect::<Vec<_>>().join(", ")
+                )
+            }
+            Message::RequestTxs(ids) => {
+                write!(
+                    f,
+                    "RequestTxs(ids: [{}])",
+                    ids.iter().map(|id| format!("{}", id)).collect::<Vec<_>>().join(", ")
+                )
+            }
+            Message::ReplyTxs(txs) => {
+                write!(
+                    f,
+                    "ReplyTxs(txs: [{}])",
+                    txs.iter().map(|tx| format!("{}", TxId::from(tx))).collect::<Vec<_>>().join(", ")
+                )
+            }
+            Message::Done => write!(f, "Done"),
+        }
+    }
+}
+
+/// Messages coming directly from the muxer.
+#[derive(Debug, PartialEq, Eq, Clone, serde::Serialize, serde::Deserialize)]
+pub enum TxSubmissionMessage {
+    Registered,
+    FromNetwork(NonEmptyBytes),
+}
+
+/// Roundtrip property tests for txsubmission messages.
+#[cfg(test)]
+mod tests {
+    use amaru_kernel::{Hash, Transaction, prop_cbor_roundtrip};
+    use prop::collection::vec;
+    use proptest::{prelude::*, prop_compose};
+
+    use super::*;
+    use crate::tx_submission::tests::create_transaction;
+
+    mod tx_id {
+        use super::*;
+        prop_cbor_roundtrip!(TxId, any_tx_id());
+    }
+    mod message {
+        use super::*;
+        prop_cbor_roundtrip!(Message, any_message());
+    }
+    mod blocking {
+        use super::*;
+        prop_cbor_roundtrip!(Blocking, any_blocking());
+    }
+
+    // HELPERS
+
+    prop_compose! {
+        pub fn any_tx_id()(
+            bytes in any::<[u8; 32]>(),
+        ) -> TxId {
+            TxId::new(Hash::new(bytes))
+        }
+    }
+
+    prop_compose! {
+        pub fn any_blocking()(
+            bool in any::<bool>(),
+        ) -> Blocking {
+            if bool { Blocking::Yes } else { Blocking::No }
+        }
+    }
+
+    prop_compose! {
+        fn any_ack_req()(ack in 0u16..=1000, req in 0u16..=1000) -> (u16, u16) {
+            (ack, req)
+        }
+    }
+
+    prop_compose! {
+        fn any_tx_id_and_sizes_vec()(ids in vec(any_tx_id(), 0..20), sizes in vec(any::<u32>(), 0..20)) -> Vec<(TxId, u32)> {
+            ids.iter().zip(sizes).map(|(id, size)| (*id, size)).collect()
+        }
+    }
+
+    prop_compose! {
+        fn any_tx_id_vec()(ids in prop::collection::vec(any_tx_id(), 0..20)) -> Vec<TxId> {
+            ids
+        }
+    }
+
+    prop_compose! {
+        fn any_tx_vec()(txs in prop::collection::vec(any_tx(), 0..10)) -> Vec<Transaction> {
+            txs
+        }
+    }
+
+    prop_compose! {
+        fn any_tx()(n in 0u64..=1000) -> Transaction {
+            create_transaction(n)
+        }
+    }
+
+    fn init_message() -> impl Strategy<Value = Message> {
+        Just(Message::Init)
+    }
+
+    prop_compose! {
+        fn request_tx_ids_message()((ack, req) in any_ack_req(), blocking in any_blocking()) -> Message {
+            match blocking {
+                Blocking::Yes => Message::RequestTxIdsBlocking(ack, req),
+                Blocking::No => Message::RequestTxIdsNonBlocking(ack, req),
+            }
+        }
+    }
+
+    prop_compose! {
+        fn reply_tx_ids_message()(ids in any_tx_id_and_sizes_vec()) -> Message {
+            Message::ReplyTxIds(ids)
+        }
+    }
+
+    prop_compose! {
+        fn request_txs_message()(ids in any_tx_id_vec()) -> Message {
+            Message::RequestTxs(ids)
+        }
+    }
+
+    prop_compose! {
+        fn reply_txs_message()(txs in any_tx_vec()) -> Message {
+            Message::ReplyTxs(txs)
+        }
+    }
+
+    fn done_message() -> impl Strategy<Value = Message> {
+        Just(Message::Done)
+    }
+
+    pub fn any_message() -> impl Strategy<Value = Message> {
+        prop_oneof![
+            1 => init_message(),
+            3 => request_tx_ids_message(),
+            3 => reply_tx_ids_message(),
+            3 => request_txs_message(),
+            3 => reply_txs_message(),
+            1 => done_message(),
+        ]
+    }
+}

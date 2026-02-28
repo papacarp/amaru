@@ -12,87 +12,36 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::stage_ref::StageStateRef;
+use std::{any::Any, fmt, future::Future};
+
+use tokio::sync::mpsc;
+
 use crate::{
-    BoxFuture, Effects, Instant, Name, OutputEffect, Receiver, Resources, SendData, Sender,
-    StageBuildRef, StageRef, types::MpscSender,
-};
-use std::{
-    fmt::Debug,
-    future::Future,
-    marker::PhantomData,
-    sync::atomic::{AtomicU64, Ordering},
-};
-use tokio::{
-    runtime::Handle,
-    sync::{mpsc, oneshot},
+    BoxFuture, Effects, Instant, Name, OutputEffect, Receiver, Resources, SendData, Sender, StageBuildRef, StageRef,
+    stage_ref::StageStateRef, types::MpscSender,
 };
 
-/// A unique identifier for a call effect.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-pub struct CallId(u64);
-
-impl CallId {
-    pub(crate) fn new() -> Self {
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        Self(COUNTER.fetch_add(1, Ordering::Relaxed))
-    }
-
-    #[cfg(all(feature = "simulation", test))]
-    pub(crate) fn from_u64(u: u64) -> Self {
-        Self(u)
-    }
-}
-
-/// The response channel for a call effect.
+/// A time specifying when an effect should be executed.
+/// The identifier (u64) specifies the precise effect to execute at that time in a map of
+/// scheduled effects maintained by the runtime (whether simulation or tokio).
 ///
-/// In order to respond to the calling stage, use [`Effects::respond`].
-#[derive(serde::Serialize, serde::Deserialize)]
-pub struct CallRef<Resp: SendData> {
-    pub(crate) target: Name,
-    pub(crate) id: CallId,
-    pub(crate) deadline: Instant,
-    #[serde(skip, default = "dummy_response")]
-    pub(crate) response: oneshot::Sender<Box<dyn SendData>>,
-    #[serde(skip)]
-    pub(crate) _ph: PhantomData<Resp>,
-}
+/// It is important to note that ScheduleId is ordered by time first, then by id.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Copy, serde::Serialize, serde::Deserialize)]
+pub struct ScheduleId(Instant, u64);
 
-// FIXME: will need to inject deserialization context to reconstruct a channel
-fn dummy_response() -> oneshot::Sender<Box<dyn SendData>> {
-    oneshot::channel().0
-}
+impl ScheduleId {
+    pub(crate) fn new(id: u64, instant: Instant) -> Self {
+        Self(instant, id)
+    }
 
-impl<Resp: SendData + PartialEq> PartialEq for CallRef<Resp> {
-    fn eq(&self, other: &Self) -> bool {
-        self.id == other.id
+    pub fn time(&self) -> Instant {
+        self.0
     }
 }
 
-impl<Resp: SendData> Debug for CallRef<Resp> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CallRef")
-            .field("target", &self.target)
-            .field("id", &self.id)
-            .field("deadline", &self.deadline)
-            .finish()
-    }
-}
-
-impl<Resp: SendData> CallRef<Resp> {
-    /// Create a dummy that compares equal to its original but doesn’t actually work.
-    ///
-    /// This is useful within test procedures to retain a properly typed reference
-    /// that can be used as argument to [`assert_respond`](crate::Effect::assert_respond)
-    /// and [`resume_respond`](crate::effect_box::SimulationRunning::resume_respond).
-    pub fn dummy(&self) -> Self {
-        Self {
-            target: self.target.clone(),
-            id: self.id,
-            deadline: self.deadline,
-            response: oneshot::channel().0,
-            _ph: PhantomData,
-        }
+impl fmt::Display for ScheduleId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "id {} at {}", self.1, self.0)
     }
 }
 
@@ -132,9 +81,6 @@ impl<Resp: SendData> CallRef<Resp> {
 /// let mut running = network.run(rt.handle().clone());
 /// ```
 pub trait StageGraph {
-    type Running: StageGraphRunning;
-    type RefAux<Msg, State>;
-
     /// Create a stage from an asynchronous transition function (state × message → state) and
     /// an initial state.
     ///
@@ -158,11 +104,7 @@ pub trait StageGraph {
     ///     }
     /// }
     /// ```
-    fn stage<Msg, St, F, Fut>(
-        &mut self,
-        name: impl AsRef<str>,
-        f: F,
-    ) -> StageBuildRef<Msg, St, Self::RefAux<Msg, St>>
+    fn stage<Msg, St, F, Fut>(&mut self, name: impl AsRef<str>, f: F) -> StageBuildRef<Msg, St, Box<dyn Any + Send>>
     where
         F: FnMut(St, Msg, Effects<Msg>) -> Fut + 'static + Send,
         Fut: Future<Output = St> + 'static + Send,
@@ -172,12 +114,19 @@ pub trait StageGraph {
     /// Finalize the given stage by providing its initial state.
     fn wire_up<Msg, St>(
         &mut self,
-        stage: StageBuildRef<Msg, St, Self::RefAux<Msg, St>>,
+        stage: StageBuildRef<Msg, St, Box<dyn Any + Send>>,
         state: St,
     ) -> StageStateRef<Msg, St>
     where
         Msg: SendData + serde::de::DeserializeOwned,
         St: SendData;
+
+    fn contramap<Original: SendData, Mapped: SendData>(
+        &mut self,
+        stage_ref: impl AsRef<StageRef<Original>>,
+        new_name: impl AsRef<str>,
+        transform: impl Fn(Mapped) -> Original + 'static + Send,
+    ) -> StageRef<Mapped>;
 
     /// Preload the given stage’s mailbox with the given messages.
     ///
@@ -189,15 +138,7 @@ pub trait StageGraph {
         &mut self,
         stage: impl AsRef<StageRef<Msg>>,
         messages: impl IntoIterator<Item = Msg>,
-    ) -> bool;
-
-    /// Consume this network builder and start the network — the precise meaning of this
-    /// depends on the `StageGraph` implementation used.
-    ///
-    /// For example [`TokioBuilder`](crate::tokio::TokioBuilder) will spawn each stage as
-    /// a task while [`SimulationBuilder`](crate::effect_box::SimulationBuilder) won’t
-    /// run anything unless explicitly requested by a test procedure.
-    fn run(self, rt: Handle) -> Self::Running;
+    ) -> Result<(), Box<dyn SendData>>;
 
     /// Obtain a handle for sending messages to the given stage from outside the network.
     fn input<Msg: SendData>(&mut self, stage: impl AsRef<StageRef<Msg>>) -> Sender<Msg>;
@@ -206,11 +147,7 @@ pub trait StageGraph {
     ///
     /// The returned [`Receiver`] can be used synchronously (e.g. in tests) or as an
     /// asynchronous [`Stream`](futures_util::Stream).
-    fn output<Msg>(
-        &mut self,
-        name: impl AsRef<str>,
-        send_queue_size: usize,
-    ) -> (StageRef<Msg>, Receiver<Msg>)
+    fn output<Msg>(&mut self, name: impl AsRef<str>, send_queue_size: usize) -> (StageRef<Msg>, Receiver<Msg>)
     where
         Msg: SendData + PartialEq + serde::Serialize + serde::de::DeserializeOwned,
     {
@@ -219,8 +156,7 @@ pub trait StageGraph {
         let tx = MpscSender { sender };
 
         let output = self.stage(name, async |tx: MpscSender<Msg>, msg: Msg, eff| {
-            eff.external(OutputEffect::new(eff.me().name().clone(), msg, tx.clone()))
-                .await;
+            eff.external(OutputEffect::new(eff.me().name().clone(), msg, tx.clone())).await;
             tx
         });
         let output = self.wire_up(output, tx);
@@ -236,11 +172,20 @@ pub trait StageGraph {
 
 /// A trait for running stage graphs.
 ///
-/// This trait is implemented by the return value of the [`StageGraph::run`] method.
+/// This trait is implemented by the return value of the [`SimulationBuilder::run`](crate::simulation::SimulationBuilder::run) method.
 pub trait StageGraphRunning {
     /// Returns true if the stage graph has observed a termination signal.
     fn is_terminated(&self) -> bool;
 
     /// A future that resolves once the stage graph has terminated.
     fn termination(&self) -> BoxFuture<'static, ()>;
+}
+
+/// Generate a unique name for a stage.
+///
+/// This naming convention must be used by all StageGraph implementations to make them compatible
+/// in terms of TraceBuffer replay.
+pub fn stage_name(counter: &mut usize, prefix: &str) -> Name {
+    *counter += 1;
+    Name::from(&*format!("{}-{}", prefix, counter))
 }

@@ -12,18 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::cbor;
 use std::fmt::Display;
+
+use minicbor::decode;
+
+use crate::cbor;
 
 pub mod lazy;
 
 // Misc
 // ----------------------------------------------------------------------------
 
-pub fn decode_break<'d>(
-    d: &mut cbor::Decoder<'d>,
-    len: Option<u64>,
-) -> Result<bool, cbor::decode::Error> {
+pub fn decode_break<'d>(d: &mut cbor::Decoder<'d>, len: Option<u64>) -> Result<bool, cbor::decode::Error> {
     if d.datatype()? == cbor::data::Type::Break {
         // NOTE: If we encounter a rogue Break while decoding a definite map, that's an error.
         if len.is_some() {
@@ -38,28 +38,43 @@ pub fn decode_break<'d>(
     Ok(false)
 }
 
+/// Decode a chunk, but retain a reference to the decoded bytes.
+pub fn tee<'d, A>(
+    d: &mut cbor::Decoder<'d>,
+    decoder: impl FnOnce(&mut cbor::Decoder<'d>) -> Result<A, cbor::decode::Error>,
+) -> Result<(A, &'d [u8]), cbor::decode::Error> {
+    let original_bytes = d.input();
+    let start = d.position();
+    let a = decoder(d)?;
+    let end = d.position();
+    Ok((a, &original_bytes[start..end]))
+}
+
 // Array
 // ----------------------------------------------------------------------------
 
 /// Decode any heterogeneous CBOR array, irrespective of whether they're indefinite or definite.
+///
+/// FIXME: Allow callers to check that the length is not static, but simply matches what is
+/// advertised; e.g. using `Option<u64>` as a callback.
 pub fn heterogeneous_array<'d, A>(
     d: &mut cbor::Decoder<'d>,
     elems: impl FnOnce(
         &mut cbor::Decoder<'d>,
-        Box<dyn FnOnce(u64) -> Result<(), cbor::decode::Error>>,
+        &dyn Fn(u64) -> Result<(), cbor::decode::Error>,
     ) -> Result<A, cbor::decode::Error>,
 ) -> Result<A, cbor::decode::Error> {
     let len = d.array()?;
 
     match len {
         None => {
-            let result = elems(d, Box::new(|_| Ok(())))?;
+            let result = elems(d, &|_| Ok(()))?;
             decode_break(d, len)?;
             Ok(result)
         }
         Some(len) => elems(
             d,
-            Box::new(move |expected_len| {
+            &(move |expected_len| {
                 if len != expected_len {
                     return Err(cbor::decode::Error::message(format!(
                         "CBOR array length mismatch: expected {} got {}",
@@ -73,30 +88,42 @@ pub fn heterogeneous_array<'d, A>(
     }
 }
 
+/// This function checks the size of an array containing a tagged value.
+/// The `label` parameter is used to identify which variant is being checked.
+///
+/// FIXME: suspicious check_tagged_array_length
+///
+/// This function is a code smell and seems to indicate that we are manually decoding def
+/// array somewhere, instead of using the heterogeneous_array above to also deal indef arrays.
+/// There might be a good reason why this function exists; I haven't checked, but leaving a note
+/// for later to check.
+pub fn check_tagged_array_length(label: usize, actual: Option<u64>, expected: u64) -> Result<(), decode::Error> {
+    if actual != Some(expected) {
+        Err(decode::Error::message(format!("expected array length {expected} for label {label}, got: {actual:?}")))
+    } else {
+        Ok(())
+    }
+}
+
 // Map
 // ----------------------------------------------------------------------------
 
 /// Decode any heterogeneous CBOR map, irrespective of whether they're indefinite or definite.
 ///
-/// A good choice for `S` is generally to pick a tuple of `PartialDecoder<_>` for each field item
+/// A good choice for `S` is generally to pick a tuple of `Option` for each field item
 /// that needs decoding. For example:
 ///
 /// ```rs
 /// let (address, value, datum, script) = decode_map(
 ///     d,
-///     (
-///         missing_field::<Output, _>(0),
-///         missing_field::<Output, _>(1),
-///         with_default_value(MemoizedDatum::None),
-///         with_default_value(None),
-///     ),
+///     (None, None, MemoizedDatum::None, None),
 ///     |d| d.u8(),
 ///     |d, state, field| {
 ///         match field {
-///             0 => state.0 = decode_chunk(d, |d| decode_address(d.bytes()?)),
-///             1 => state.1 = decode_chunk(d, |d| d.decode()),
-///             2 => state.2 = decode_chunk(d, decode_datum),
-///             3 => state.3 = decode_chunk(d, decode_reference_script),
+///             0 => state.0 = Some(decode_address(d.bytes()?),
+///             1 => state.1 = Some(d.decode()?),
+///             2 => state.2 = decode_datum()?,
+///             3 => state.3 = decode_reference_script()?,
 ///             _ => return unexpected_field::<Output, _>(field),
 ///         }
 ///         Ok(())
@@ -126,38 +153,15 @@ pub fn heterogeneous_map<K, S>(
     Ok(state)
 }
 
-// PartialDecoder
-// ----------------------------------------------------------------------------
-
-/// A decoder that is part of another larger one. This is particularly useful to decode map
-/// key/value in an arbitrary order; while logically recomposing them in a readable order.
-type PartialDecoder<A> = Box<dyn FnOnce() -> Result<A, cbor::decode::Error>>;
-
-/// Wrap a decoder as a `PartialDecoder`; this is mostly a convenient utility to avoid boilerplate.
-pub fn decode_chunk<A: 'static>(
-    d: &mut cbor::Decoder<'_>,
-    decode: impl FnOnce(&mut cbor::Decoder<'_>) -> Result<A, cbor::decode::Error>,
-) -> PartialDecoder<A> {
-    // NOTE: It is crucial that this happens *outside* of the boxed closure, to ensure bytes are consumed
-    // when the closure is created; not when it is invoked!
-    let a = decode(d);
-    Box::new(|| a)
-}
-
 /// Yield a `PartialDecoder` that fails with a comprehensible error message when an expected field
 /// is missing from the map.
-pub fn missing_field<C: ?Sized, A>(field_tag: impl Display) -> PartialDecoder<A> {
+pub fn missing_field<C: ?Sized, A>(field_tag: u8) -> cbor::decode::Error {
     let msg = format!(
         "missing <{}> at field .{field_tag} in <{}> CBOR map",
         std::any::type_name::<A>(),
         std::any::type_name::<C>(),
     );
-    Box::new(move || Err(cbor::decode::Error::message(msg)))
-}
-
-/// Yield a `PartialDecoder` that always succeeds with the given default value.
-pub fn with_default_value<A: 'static>(default: A) -> PartialDecoder<A> {
-    Box::new(move || Ok(default))
+    cbor::decode::Error::message(msg)
 }
 
 /// Yield a `Result<_, decode::Error>` that always fails with a comprehensible error message when a
@@ -174,19 +178,16 @@ pub fn unexpected_field<C: ?Sized, A>(field_tag: impl Display) -> Result<A, cbor
 
 #[cfg(test)]
 mod tests {
-    use crate::{
-        cbor, decode_chunk, from_cbor, from_cbor_no_leftovers, heterogeneous_array,
-        heterogeneous_map, missing_field,
-        tests::{AsDefinite, AsIndefinite, AsMap, foo::Foo},
-        to_cbor, unexpected_field, with_default_value,
-    };
     use std::fmt::Debug;
 
+    use crate::{
+        cbor, from_cbor, from_cbor_no_leftovers, heterogeneous_array, heterogeneous_map, missing_field,
+        tests::{AsDefinite, AsIndefinite, AsMap, foo::Foo},
+        to_cbor, unexpected_field,
+    };
+
     fn assert_ok<T: Eq + Debug + for<'d> cbor::decode::Decode<'d, ()>>(left: T, bytes: &[u8]) {
-        assert_eq!(
-            Ok(left),
-            from_cbor_no_leftovers::<T>(bytes).map_err(|e| e.to_string())
-        );
+        assert_eq!(Ok(left), from_cbor_no_leftovers::<T>(bytes).map_err(|e| e.to_string()));
     }
 
     fn assert_err<T: Debug + for<'d> cbor::decode::Decode<'d, ()>>(msg: &str, bytes: &[u8]) {
@@ -196,10 +197,7 @@ mod tests {
         }
     }
 
-    const FIXTURE: Foo = Foo {
-        field0: 14,
-        field1: 42,
-    };
+    const FIXTURE: Foo = Foo { field0: 14, field1: 42 };
 
     mod heterogeneous_array_tests {
         use super::*;
@@ -211,16 +209,10 @@ mod tests {
 
             // A flexible decoder that can ingest both definite and indefinite arrays.
             impl<'d, C> cbor::decode::Decode<'d, C> for TestCase<Foo> {
-                fn decode(
-                    d: &mut cbor::Decoder<'d>,
-                    ctx: &mut C,
-                ) -> Result<Self, cbor::decode::Error> {
+                fn decode(d: &mut cbor::Decoder<'d>, ctx: &mut C) -> Result<Self, cbor::decode::Error> {
                     heterogeneous_array(d, |d, assert_len| {
                         assert_len(2)?;
-                        Ok(TestCase(Foo {
-                            field0: d.decode_with(ctx)?,
-                            field1: d.decode_with(ctx)?,
-                        }))
+                        Ok(TestCase(Foo { field0: d.decode_with(ctx)?, field1: d.decode_with(ctx)? }))
                     })
                 }
             }
@@ -236,16 +228,10 @@ mod tests {
 
             // A decoder which expects less elements than actually supplied.
             impl<'d, C> cbor::decode::Decode<'d, C> for TestCase<Foo> {
-                fn decode(
-                    d: &mut cbor::Decoder<'d>,
-                    ctx: &mut C,
-                ) -> Result<Self, cbor::decode::Error> {
+                fn decode(d: &mut cbor::Decoder<'d>, ctx: &mut C) -> Result<Self, cbor::decode::Error> {
                     heterogeneous_array(d, |d, assert_len| {
                         assert_len(1)?;
-                        Ok(TestCase(Foo {
-                            field0: d.decode_with(ctx)?,
-                            field1: d.decode_with(ctx)?,
-                        }))
+                        Ok(TestCase(Foo { field0: d.decode_with(ctx)?, field1: d.decode_with(ctx)? }))
                     })
                 }
             }
@@ -260,16 +246,10 @@ mod tests {
 
             // A decoder which expects more elements than actually supplied.
             impl<'d, C> cbor::decode::Decode<'d, C> for TestCase<Foo> {
-                fn decode(
-                    d: &mut cbor::Decoder<'d>,
-                    ctx: &mut C,
-                ) -> Result<Self, cbor::decode::Error> {
+                fn decode(d: &mut cbor::Decoder<'d>, ctx: &mut C) -> Result<Self, cbor::decode::Error> {
                     heterogeneous_array(d, |d, assert_len| {
                         assert_len(3)?;
-                        Ok(TestCase(Foo {
-                            field0: d.decode_with(ctx)?,
-                            field1: d.decode_with(ctx)?,
-                        }))
+                        Ok(TestCase(Foo { field0: d.decode_with(ctx)?, field1: d.decode_with(ctx)? }))
                     })
                 }
             }
@@ -313,12 +293,12 @@ mod tests {
             fn decode(d: &mut cbor::Decoder<'d>, ctx: &mut C) -> Result<Self, cbor::decode::Error> {
                 let (field0, field1) = heterogeneous_map(
                     d,
-                    (missing_field::<Foo, _>(0), missing_field::<Foo, _>(1)),
+                    (None::<u8>, None::<u8>),
                     |d| d.u8(),
                     |d, state, field| {
                         match field {
-                            0 => state.0 = decode_chunk(d, |d| d.decode_with(ctx)),
-                            1 => state.1 = decode_chunk(d, |d| d.decode_with(ctx)),
+                            0 => state.0 = d.decode_with(ctx)?,
+                            1 => state.1 = d.decode_with(ctx)?,
                             _ => return unexpected_field::<Foo, _>(field),
                         }
                         Ok(())
@@ -326,8 +306,8 @@ mod tests {
                 )?;
 
                 Ok(NoMissingFields(Foo {
-                    field0: field0()?,
-                    field1: field1()?,
+                    field0: field0.ok_or_else(|| missing_field::<Foo, u8>(0))?,
+                    field1: field1.ok_or_else(|| missing_field::<Foo, u8>(1))?,
                 }))
             }
         }
@@ -339,36 +319,27 @@ mod tests {
             fn decode(d: &mut cbor::Decoder<'d>, ctx: &mut C) -> Result<Self, cbor::decode::Error> {
                 let (field0, field1) = heterogeneous_map(
                     d,
-                    (with_default_value(14_u8), with_default_value(42_u8)),
+                    (14_u8, 42_u8),
                     |d| d.u8(),
                     |d, state, field| {
                         match field {
-                            0 => state.0 = decode_chunk(d, |d| d.decode_with(ctx)),
-                            1 => state.1 = decode_chunk(d, |d| d.decode_with(ctx)),
+                            0 => state.0 = d.decode_with(ctx)?,
+                            1 => state.1 = d.decode_with(ctx)?,
                             _ => return unexpected_field::<Foo, _>(field),
                         }
                         Ok(())
                     },
                 )?;
 
-                Ok(WithDefaultValues(Foo {
-                    field0: field0()?,
-                    field1: field1()?,
-                }))
+                Ok(WithDefaultValues(Foo { field0, field1 }))
             }
         }
 
         #[test]
         fn no_optional_fields_no_missing_fields() {
-            assert_ok(
-                NoMissingFields(FIXTURE),
-                &to_cbor(&AsIndefinite(AsMap(&FIXTURE))),
-            );
+            assert_ok(NoMissingFields(FIXTURE), &to_cbor(&AsIndefinite(AsMap(&FIXTURE))));
 
-            assert_ok(
-                NoMissingFields(FIXTURE),
-                &to_cbor(&AsDefinite(AsMap(&FIXTURE))),
-            );
+            assert_ok(NoMissingFields(FIXTURE), &to_cbor(&AsDefinite(AsMap(&FIXTURE))));
         }
 
         #[test]
@@ -397,15 +368,9 @@ mod tests {
 
         #[test]
         fn optional_fields_no_missing_fields() {
-            assert_ok(
-                WithDefaultValues(FIXTURE),
-                &to_cbor(&AsIndefinite(AsMap(&FIXTURE))),
-            );
+            assert_ok(WithDefaultValues(FIXTURE), &to_cbor(&AsIndefinite(AsMap(&FIXTURE))));
 
-            assert_ok(
-                WithDefaultValues(FIXTURE),
-                &to_cbor(&AsDefinite(AsMap(&FIXTURE))),
-            );
+            assert_ok(WithDefaultValues(FIXTURE), &to_cbor(&AsDefinite(AsMap(&FIXTURE))));
         }
 
         #[test]
@@ -440,25 +405,13 @@ mod tests {
                 }
             }
 
-            assert_err::<NoMissingFields<Foo>>(
-                "missing <u8> at field .1",
-                &to_cbor(&TestCase(AsIndefinite(&FIXTURE))),
-            );
+            assert_err::<NoMissingFields<Foo>>("missing <u8> at field .1", &to_cbor(&TestCase(AsIndefinite(&FIXTURE))));
 
-            assert_ok(
-                WithDefaultValues(FIXTURE),
-                &to_cbor(&TestCase(AsIndefinite(&FIXTURE))),
-            );
+            assert_ok(WithDefaultValues(FIXTURE), &to_cbor(&TestCase(AsIndefinite(&FIXTURE))));
 
-            assert_err::<NoMissingFields<Foo>>(
-                "missing <u8> at field .0",
-                &to_cbor(&TestCase(AsDefinite(&FIXTURE))),
-            );
+            assert_err::<NoMissingFields<Foo>>("missing <u8> at field .0", &to_cbor(&TestCase(AsDefinite(&FIXTURE))));
 
-            assert_ok(
-                WithDefaultValues(FIXTURE),
-                &to_cbor(&TestCase(AsDefinite(&FIXTURE))),
-            );
+            assert_ok(WithDefaultValues(FIXTURE), &to_cbor(&TestCase(AsDefinite(&FIXTURE))));
         }
 
         #[test]
@@ -481,10 +434,7 @@ mod tests {
                 }
             }
 
-            assert_err::<WithDefaultValues<Foo>>(
-                "unexpected type break",
-                &to_cbor(&TestCase(&FIXTURE)),
-            );
+            assert_err::<WithDefaultValues<Foo>>("unexpected type break", &to_cbor(&TestCase(&FIXTURE)));
         }
 
         #[test]
@@ -508,10 +458,7 @@ mod tests {
                 }
             }
 
-            assert_err::<WithDefaultValues<Foo>>(
-                "unexpected field .14",
-                &to_cbor(&TestCase(&FIXTURE)),
-            );
+            assert_err::<WithDefaultValues<Foo>>("unexpected field .14", &to_cbor(&TestCase(&FIXTURE)));
         }
     }
 }

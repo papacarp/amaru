@@ -12,74 +12,60 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use amaru_consensus::{DiagnosticChainStore, ReadOnlyChainStore};
-use amaru_kernel::network::NetworkName;
-use amaru_kernel::string_utils::ListToString;
-use amaru_kernel::to_cbor;
-use amaru_kernel::{BlockHeader, IsHeader};
-use amaru_stores::rocksdb::RocksDbConfig;
-use amaru_stores::rocksdb::consensus::{ReadOnlyChainDB, RocksDBStore};
-use clap::Parser;
-use std::fmt::Display;
-use std::{error::Error, path::PathBuf};
-use tracing::info;
+use std::{error::Error, fmt::Display, path::PathBuf};
 
-use crate::cmd::default_chain_dir;
+use amaru::{DEFAULT_NETWORK, default_chain_dir};
+use amaru_kernel::{BlockHeader, IsHeader, NetworkName, to_cbor, utils::string::ListToString};
+use amaru_ouroboros::{DiagnosticChainStore, ReadOnlyChainStore};
+use amaru_stores::rocksdb::{
+    RocksDbConfig,
+    consensus::{ReadOnlyChainDB, RocksDBStore},
+};
+use clap::Parser;
+use tracing::info;
 
 #[derive(Debug, Parser)]
 pub struct Args {
-    /// Network for which we are importing headers.
-    ///
-    /// Should be one of 'mainnet', 'preprod', 'preview' or 'testnet_<magic>' where
-    /// `magic` is a 32-bits unsigned value denoting a particular testnet.
+    /// The path to the chain database to dump.
     #[arg(
         long,
-        value_name = "NETWORK",
-        env = "AMARU_NETWORK",
-        default_value_t = super::DEFAULT_NETWORK,
+        value_name = amaru::value_names::DIRECTORY,
+        env = amaru::env_vars::CHAIN_DIR
+    )]
+    chain_dir: Option<PathBuf>,
+
+    /// Network for which we are importing headers.
+    #[arg(
+        long,
+        value_name = amaru::value_names::NETWORK,
+        env = amaru::env_vars::NETWORK,
+        default_value_t = DEFAULT_NETWORK,
     )]
     network: NetworkName,
-
-    /// The path to the chain database to dump
-    #[arg(long, value_name = "DIR", env = "AMARU_CHAIN_DIR")]
-    chain_dir: Option<PathBuf>,
 }
 
 pub async fn run(args: Args) -> Result<(), Box<dyn Error>> {
-    let chain_dir = args
-        .chain_dir
-        .unwrap_or_else(|| default_chain_dir(args.network).into());
+    let chain_dir = args.chain_dir.unwrap_or_else(|| default_chain_dir(args.network).into());
 
-    info!(network = %args.network, chain_dir=%chain_dir.to_string_lossy(),
-          "Running command dump-chain-db",
+    info!(
+        _command = "dump-chain-db",
+        chain_dir = %chain_dir.to_string_lossy(),
+        network = %args.network,
+        "running",
     );
 
-    let db: ReadOnlyChainDB = RocksDBStore::open_for_readonly(RocksDbConfig::new(chain_dir))?;
+    let db: ReadOnlyChainDB = RocksDBStore::open_for_readonly(&RocksDbConfig::new(chain_dir))?;
 
     print_iterator(
         "headers",
-        db.load_headers().map(|header| {
-            (
-                format!("\n{}", header.hash()),
-                hex::encode(to_cbor(&header)),
-            )
-        }),
+        db.load_headers().map(|header| (format!("\n{}", header.hash()), hex::encode(to_cbor(&header)))),
     );
     print_iterator(
         "parent -> children relationships\n",
-        db.load_parents_children()
-            .map(|(parent, children)| (parent, children.list_to_string(", "))),
+        db.load_parents_children().map(|(parent, children)| (parent, children.list_to_string(", "))),
     );
-    print_iterator(
-        "nonces\n",
-        db.load_nonces()
-            .map(|(hash, nonces)| (hash, hex::encode(to_cbor(&nonces)))),
-    );
-    print_iterator(
-        "blocks\n",
-        db.load_blocks()
-            .map(|(hash, block)| (hash, hex::encode(block.to_vec()))),
-    );
+    print_iterator("nonces\n", db.load_nonces().map(|(hash, nonces)| (hash, hex::encode(to_cbor(&nonces)))));
+    print_iterator("blocks\n", db.load_blocks().map(|(hash, block)| (hash, hex::encode(block.to_vec()))));
     print_best_chain(db);
     Ok(())
 }
@@ -88,10 +74,7 @@ pub async fn run(args: Args) -> Result<(), Box<dyn Error>> {
 pub fn print_best_chain(db: ReadOnlyChainDB) {
     println!();
     let best_chain = <ReadOnlyChainDB as ReadOnlyChainStore<BlockHeader>>::retrieve_best_chain(&db);
-    println!(
-        "The best chain is:\n  {}",
-        best_chain.list_to_string("\n  ")
-    );
+    println!("The best chain is:\n  {}", best_chain.list_to_string("\n  "));
 
     println!();
     println!("The best chain length is: {}", best_chain.len());

@@ -12,13 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::rocksdb::{
-    common::{PREFIX_LEN, as_key, as_value},
-    dreps_delegations,
-};
 use amaru_kernel::{
-    CertificatePointer, DRep, Lovelace, PROTOCOL_VERSION_9, ProtocolVersion, StakeCredential,
-    StakeCredentialType, stake_credential_hash,
+    AsHash, CertificatePointer, DRep, Lovelace, PROTOCOL_VERSION_9, ProtocolVersion, StakeCredential,
+    StakeCredentialKind,
 };
 use amaru_ledger::{
     state::diff_bind::Resettable,
@@ -30,8 +26,13 @@ use amaru_ledger::{
         },
     },
 };
-use rocksdb::Transaction;
+use rocksdb::{DBPinnableSlice, Transaction};
 use tracing::{debug, error};
+
+use crate::rocksdb::{
+    common::{PREFIX_LEN, as_key, as_value},
+    dreps_delegations,
+};
 
 /// Name prefixed used for storing Account entries. UTF-8 encoding for "acct"
 pub const PREFIX: [u8; PREFIX_LEN] = [0x61, 0x63, 0x63, 0x74];
@@ -50,10 +51,8 @@ pub fn reset_delegation<DB>(
     for (credential, unregistered_at) in rows {
         let key = as_key(&PREFIX, &credential);
 
-        let entry = db
-            .get(&key)
-            .map_err(|err| StoreError::Internal(err.into()))?
-            .map(unsafe_decode::<Row>);
+        let entry =
+            db.get_pinned(&key).map_err(|err| StoreError::Internal(err.into()))?.map(|d| unsafe_decode::<Row>(&d));
 
         if let Some(mut row) = entry {
             // Check whether the existing delegation is not taking precedence over the previous
@@ -101,14 +100,13 @@ pub fn reset_delegation<DB>(
                 debug!(
                     unregistered.at = %unregistered_at,
                     redelegated.since = %delegated_since,
-                    delegator.type = %StakeCredentialType::from(&credential),
-                    delegator.hash = %stake_credential_hash(&credential),
+                    delegator.type = %StakeCredentialKind::from(&credential),
+                    delegator.hash = %credential.as_hash(),
                     "delegator has already re-delegated; ignoring previous drep de-registration",
                 );
             } else {
                 row.drep = None;
-                db.put(key, as_value(row))
-                    .map_err(|err| StoreError::Internal(err.into()))?;
+                db.put(key, as_value(row)).map_err(|err| StoreError::Internal(err.into()))?;
             }
         }
     }
@@ -127,17 +125,13 @@ pub fn add<DB>(
     for (credential, (pool, drep, deposit, rewards)) in rows {
         let key = as_key(&PREFIX, &credential);
 
-        let new_drep_is_predefined = matches!(
-            drep,
-            Resettable::Set((DRep::Abstain, _)) | Resettable::Set((DRep::NoConfidence, _))
-        );
+        let new_drep_is_predefined =
+            matches!(drep, Resettable::Set((DRep::Abstain, _)) | Resettable::Set((DRep::NoConfidence, _)));
 
         // In case where a registration already exists, then we must only update the underlying
         // entry, while preserving the reward amount.
-        let previous_drep = if let Some(mut row) = db
-            .get(&key)
-            .map_err(|err| StoreError::Internal(err.into()))?
-            .map(unsafe_decode::<Row>)
+        let previous_drep = if let Some(mut row) =
+            db.get_pinned(&key).map_err(|err| StoreError::Internal(err.into()))?.map(|d| unsafe_decode::<Row>(&d))
         {
             pool.set_or_reset(&mut row.pool);
             let previous_drep = drep.set_or_reset(&mut row.drep);
@@ -146,30 +140,20 @@ pub fn add<DB>(
                 row.deposit = deposit;
             }
 
-            db.put(key, as_value(row))
-                .map_err(|err| StoreError::Internal(err.into()))?;
+            db.put(key, as_value(row)).map_err(|err| StoreError::Internal(err.into()))?;
 
             Ok::<_, StoreError>(previous_drep)
         } else if let Some(deposit) = deposit {
-            let mut row = Row {
-                deposit,
-                pool: None,
-                drep: None,
-                rewards,
-            };
+            let mut row = Row { deposit, pool: None, drep: None, rewards };
 
             pool.set_or_reset(&mut row.pool);
             let previous_drep = drep.set_or_reset(&mut row.drep);
 
-            db.put(key, as_value(row))
-                .map_err(|err| StoreError::Internal(err.into()))?;
+            db.put(key, as_value(row)).map_err(|err| StoreError::Internal(err.into()))?;
 
             Ok(previous_drep)
         } else {
-            unreachable!(
-                "attempted to create an account without a deposit: account={:?}",
-                credential
-            );
+            unreachable!("attempted to create an account without a deposit: account={:?}", credential);
         }?;
 
         // NOTE(PROTOCOL_VERSION_9):
@@ -193,21 +177,15 @@ pub fn add<DB>(
 }
 
 /// Reset rewards counter of many accounts.
-pub fn reset_many<DB>(
-    db: &Transaction<'_, DB>,
-    rows: impl Iterator<Item = Key>,
-) -> Result<(), StoreError> {
+pub fn reset_many<DB>(db: &Transaction<'_, DB>, rows: impl Iterator<Item = Key>) -> Result<(), StoreError> {
     for credential in rows {
         let key = as_key(&PREFIX, &credential);
 
-        if let Some(mut row) = db
-            .get(&key)
-            .map_err(|err| StoreError::Internal(err.into()))?
-            .map(unsafe_decode::<Row>)
+        if let Some(mut row) =
+            db.get_pinned(&key).map_err(|err| StoreError::Internal(err.into()))?.map(|d| unsafe_decode::<Row>(&d))
         {
             row.rewards = 0;
-            db.put(key, as_value(row))
-                .map_err(|err| StoreError::Internal(err.into()))?;
+            db.put(key, as_value(row)).map_err(|err| StoreError::Internal(err.into()))?;
         } else {
             error!(
                 target: EVENT_TARGET,
@@ -221,15 +199,13 @@ pub fn reset_many<DB>(
 }
 
 /// Obtain a account from the store
-pub fn get(
-    db_get: impl Fn(&[u8]) -> Result<Option<Vec<u8>>, rocksdb::Error>,
+pub fn get<'a>(
+    db_get: impl Fn(&[u8]) -> Result<Option<DBPinnableSlice<'a>>, rocksdb::Error>,
     credential: &Key,
 ) -> Result<Option<Row>, StoreError> {
     let key = as_key(&PREFIX, credential);
     let bytes = db_get(&key);
-    bytes
-        .map_err(|err| StoreError::Internal(err.into()))
-        .map(|opt| opt.map(unsafe_decode::<Row>))
+    bytes.map_err(|err| StoreError::Internal(err.into())).map(|opt| opt.map(|d| unsafe_decode::<Row>(&d)))
 }
 
 /// Alter balance of a specific account. If the account did not exist, returns the leftovers
@@ -241,21 +217,18 @@ pub fn set<DB>(
 ) -> Result<Lovelace, StoreError> {
     let key = as_key(&PREFIX, credential);
 
-    if let Some(mut row) = db
-        .get(&key)
-        .map_err(|err| StoreError::Internal(err.into()))?
-        .map(unsafe_decode::<Row>)
+    if let Some(mut row) =
+        db.get_pinned(&key).map_err(|err| StoreError::Internal(err.into()))?.map(|d| unsafe_decode::<Row>(&d))
     {
         row.rewards = with_rewards(row.rewards);
-        db.put(key, as_value(row))
-            .map_err(|err| StoreError::Internal(err.into()))?;
+        db.put(key, as_value(row)).map_err(|err| StoreError::Internal(err.into()))?;
         return Ok(0);
     }
 
     debug!(
         target: EVENT_TARGET,
-        type = %StakeCredentialType::from(credential),
-        account = %stake_credential_hash(credential),
+        type = %StakeCredentialKind::from(credential),
+        account = %credential.as_hash(),
         "set.no_account",
     );
 
@@ -263,13 +236,9 @@ pub fn set<DB>(
 }
 
 /// Clear a stake credential registration.
-pub fn remove<DB>(
-    db: &Transaction<'_, DB>,
-    rows: impl Iterator<Item = Key>,
-) -> Result<(), StoreError> {
+pub fn remove<DB>(db: &Transaction<'_, DB>, rows: impl Iterator<Item = Key>) -> Result<(), StoreError> {
     for credential in rows {
-        db.delete(as_key(&PREFIX, &credential))
-            .map_err(|err| StoreError::Internal(err.into()))?;
+        db.delete(as_key(&PREFIX, &credential)).map_err(|err| StoreError::Internal(err.into()))?;
     }
 
     Ok(())

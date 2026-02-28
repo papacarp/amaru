@@ -12,24 +12,26 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    mem,
+};
+
+use amaru_kernel::{
+    Anchor, AsHash, CertificatePointer, DRep, DRepRegistration, Epoch, Hash, Lovelace, MemoizedPlutusData,
+    MemoizedScript, MemoizedTransactionOutput, PoolId, PoolParams, Proposal, ProposalId, ProposalPointer,
+    RequiredScript, StakeCredential, StakeCredentialKind, TransactionInput, Vote, Voter, VoterKind,
+    size::{DATUM, KEY, SCRIPT},
+    utils::serde::deserialize_map_proxy,
+};
+use amaru_observability::trace;
+
 use crate::context::{
-    AccountState, AccountsSlice, CCMember, CommitteeSlice, DRepsSlice, DelegateError, Hash,
-    PoolsSlice, PotsSlice, PreparationContext, PrepareAccountsSlice, PrepareDRepsSlice,
-    PreparePoolsSlice, PrepareUtxoSlice, ProposalsSlice, RegisterError, UnregisterError,
-    UpdateError, UtxoSlice, ValidationContext, WitnessSlice, blanket_known_datums,
+    AccountState, AccountsSlice, CCMember, CommitteeSlice, DRepsSlice, DelegateError, PoolsSlice, PotsSlice,
+    PreparationContext, PrepareAccountsSlice, PrepareDRepsSlice, PreparePoolsSlice, PrepareUtxoSlice, ProposalsSlice,
+    RegisterError, UnregisterError, UpdateError, UtxoSlice, ValidationContext, WitnessSlice, blanket_known_datums,
     blanket_known_scripts,
 };
-use amaru_kernel::{
-    AddrKeyhash, Anchor, CertificatePointer, DRep, DRepRegistration, DatumHash, Lovelace,
-    MemoizedPlutusData, MemoizedScript, MemoizedTransactionOutput, PoolId, PoolParams, Proposal,
-    ProposalId, ProposalPointer, RequiredScript, ScriptHash, StakeCredential, StakeCredentialType,
-    TransactionInput, Vote, Voter, VoterType, serde_utils, stake_credential_hash,
-    voter_credential_hash,
-};
-use amaru_slot_arithmetic::Epoch;
-use core::mem;
-use std::collections::{BTreeMap, BTreeSet};
-use tracing::{Level, instrument};
 
 // ------------------------------------------------------------------------------------- Preparation
 
@@ -38,7 +40,7 @@ use tracing::{Level, instrument};
 /// pre-exists in the context.
 #[derive(serde::Deserialize, Debug, Clone)]
 pub struct AssertPreparationContext {
-    #[serde(deserialize_with = "serde_utils::deserialize_map_proxy")]
+    #[serde(deserialize_with = "deserialize_map_proxy")]
     pub utxo: BTreeMap<TransactionInput, MemoizedTransactionOutput>,
 }
 
@@ -89,18 +91,18 @@ impl PrepareDRepsSlice<'_> for AssertPreparationContext {
 
 #[derive(Debug, serde::Deserialize)]
 pub struct AssertValidationContext {
-    #[serde(deserialize_with = "serde_utils::deserialize_map_proxy")]
+    #[serde(deserialize_with = "deserialize_map_proxy")]
     utxo: BTreeMap<TransactionInput, MemoizedTransactionOutput>,
     #[serde(default)]
-    required_signers: BTreeSet<Hash<28>>,
+    required_signers: BTreeSet<Hash<KEY>>,
     #[serde(default)]
     required_scripts: BTreeSet<RequiredScript>,
     #[serde(default)]
-    known_scripts: BTreeMap<ScriptHash, TransactionInput>,
+    known_scripts: BTreeMap<Hash<SCRIPT>, TransactionInput>,
     #[serde(default)]
-    known_datums: BTreeMap<DatumHash, TransactionInput>,
+    known_datums: BTreeMap<Hash<DATUM>, TransactionInput>,
     #[serde(default)]
-    required_supplemental_datums: BTreeSet<Hash<32>>,
+    required_supplemental_datums: BTreeSet<Hash<DATUM>>,
     #[serde(default)]
     required_bootstrap_roots: BTreeSet<Hash<28>>,
 }
@@ -114,14 +116,7 @@ impl From<AssertValidationContext> for () {
 }
 
 impl PotsSlice for AssertValidationContext {
-    #[instrument(
-        level = Level::TRACE,
-        fields(
-            fee = %_fees,
-        )
-        skip_all,
-        name = "add_fees"
-    )]
+    #[trace(amaru::ledger::context::ADD_FEES, fee = _fees)]
     fn add_fees(&mut self, _fees: Lovelace) {}
 }
 
@@ -186,14 +181,9 @@ impl AccountsSlice for AssertValidationContext {
         unimplemented!()
     }
 
-    #[instrument(
-        level = Level::TRACE,
-        fields(
-            credential.type = %StakeCredentialType::from(&credential),
-            credential.hash = %stake_credential_hash(&credential),
-        )
-        skip_all,
-        name = "withdraw_from"
+    #[trace(amaru::ledger::context::WITHDRAW_FROM,
+        credential_type = StakeCredentialKind::from(&credential),
+        credential_hash = credential.as_hash()
     )]
     fn withdraw_from(&mut self, credential: StakeCredential) {
         // We don't actually do any VolatileState updates here
@@ -214,20 +204,11 @@ impl DRepsSlice for AssertValidationContext {
         unimplemented!()
     }
 
-    fn update(
-        &mut self,
-        _drep: StakeCredential,
-        _anchor: Option<Anchor>,
-    ) -> Result<(), UpdateError<StakeCredential>> {
+    fn update(&mut self, _drep: StakeCredential, _anchor: Option<Anchor>) -> Result<(), UpdateError<StakeCredential>> {
         unimplemented!()
     }
 
-    fn unregister(
-        &mut self,
-        _drep: StakeCredential,
-        _refund: Lovelace,
-        _pointer: CertificatePointer,
-    ) {
+    fn unregister(&mut self, _drep: StakeCredential, _refund: Lovelace, _pointer: CertificatePointer) {
         unimplemented!()
     }
 }
@@ -253,67 +234,40 @@ impl CommitteeSlice for AssertValidationContext {
 impl ProposalsSlice for AssertValidationContext {
     fn acknowledge(&mut self, _id: ProposalId, _pointer: ProposalPointer, _proposal: Proposal) {}
 
-    #[instrument(
-        level = Level::TRACE,
-        fields(
-            voter.type = %VoterType::from(&_voter),
-            credential.type = %StakeCredentialType::from(&_voter),
-            credential.hash = %voter_credential_hash(&_voter),
-        )
-        skip_all,
-        name = "vote"
+    #[trace(amaru::ledger::context::VOTE,
+        voter_type = VoterKind::from(&_voter),
+        credential_type = StakeCredentialKind::from(&_voter),
+        credential_hash = _voter.as_hash()
     )]
-    fn vote(&mut self, _proposal: ProposalId, _voter: Voter, _vote: Vote, _anchor: Option<Anchor>) {
-    }
+    fn vote(&mut self, _proposal: ProposalId, _voter: Voter, _vote: Vote, _anchor: Option<Anchor>) {}
 }
 
 impl WitnessSlice for AssertValidationContext {
-    #[instrument(
-        level = Level::TRACE,
-        fields(
-            hash = %vkey_hash
-        )
-        skip_all,
-        name = "require_vkey_witness"
-    )]
-    fn require_vkey_witness(&mut self, vkey_hash: AddrKeyhash) {
+    #[trace(amaru::ledger::context::REQUIRE_VKEY_WITNESS, hash = format!("{}", vkey_hash))]
+    fn require_vkey_witness(&mut self, vkey_hash: Hash<28>) {
         self.required_signers.insert(vkey_hash);
     }
 
     // TODO: add purpose to fields
-    #[instrument(
-        level = Level::TRACE,
-        fields(
-            hash = %script.hash
-        )
-        skip_all,
-        name = "require_script_witness"
-    )]
+    #[trace(amaru::ledger::context::REQUIRE_SCRIPT_WITNESS, hash = format!("{}", script.hash))]
     fn require_script_witness(&mut self, script: RequiredScript) {
         self.required_scripts.insert(script);
     }
 
-    fn acknowledge_script(&mut self, script_hash: ScriptHash, location: TransactionInput) {
+    fn acknowledge_script(&mut self, script_hash: Hash<SCRIPT>, location: TransactionInput) {
         self.known_scripts.insert(script_hash, location);
     }
 
-    fn acknowledge_datum(&mut self, datum_hash: DatumHash, location: TransactionInput) {
+    fn acknowledge_datum(&mut self, datum_hash: Hash<DATUM>, location: TransactionInput) {
         self.known_datums.insert(datum_hash, location);
     }
 
-    #[instrument(
-        level = Level::TRACE,
-        fields(
-            bootstrap_witness.hash = %root,
-        )
-        skip_all,
-        name = "require_bootstrap_witness"
-    )]
+    #[trace(amaru::ledger::context::REQUIRE_BOOTSTRAP_WITNESS, bootstrap_witness_hash = format!("{}", root))]
     fn require_bootstrap_witness(&mut self, root: Hash<28>) {
         self.required_bootstrap_roots.insert(root);
     }
 
-    fn required_signers(&mut self) -> BTreeSet<Hash<28>> {
+    fn required_signers(&mut self) -> BTreeSet<Hash<KEY>> {
         mem::take(&mut self.required_signers)
     }
 
@@ -325,20 +279,20 @@ impl WitnessSlice for AssertValidationContext {
         mem::take(&mut self.required_bootstrap_roots)
     }
 
-    fn allow_supplemental_datum(&mut self, datum_hash: Hash<32>) {
+    fn allow_supplemental_datum(&mut self, datum_hash: Hash<DATUM>) {
         self.required_supplemental_datums.insert(datum_hash);
     }
 
-    fn allowed_supplemental_datums(&mut self) -> BTreeSet<Hash<32>> {
+    fn allowed_supplemental_datums(&mut self) -> BTreeSet<Hash<DATUM>> {
         mem::take(&mut self.required_supplemental_datums)
     }
 
-    fn known_scripts(&mut self) -> BTreeMap<ScriptHash, &MemoizedScript> {
+    fn known_scripts(&mut self) -> BTreeMap<Hash<SCRIPT>, &MemoizedScript> {
         let known_scripts = mem::take(&mut self.known_scripts);
         blanket_known_scripts(self, known_scripts.into_iter())
     }
 
-    fn known_datums(&mut self) -> BTreeMap<DatumHash, &MemoizedPlutusData> {
+    fn known_datums(&mut self) -> BTreeMap<Hash<DATUM>, &MemoizedPlutusData> {
         let known_datums = mem::take(&mut self.known_datums);
         blanket_known_datums(self, known_datums.into_iter())
     }

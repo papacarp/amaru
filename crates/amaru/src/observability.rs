@@ -13,34 +13,43 @@
 // limitations under the License.
 
 use crate::{rewards_file_logger, snapshot_file_logger};
-use opentelemetry::trace::TracerProvider;
-use opentelemetry_otlp::WithExportConfig;
-use opentelemetry_sdk::{metrics::SdkMeterProvider, trace::SdkTracerProvider};
 use std::{
     env::VarError,
     error::Error,
+    fmt,
     io::{self, IsTerminal},
+    str::FromStr,
+    sync::atomic::{AtomicU64, Ordering},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tracing::{info, warn};
+
+use opentelemetry::trace::TracerProvider;
+use opentelemetry_otlp::WithExportConfig;
+use opentelemetry_sdk::{metrics::SdkMeterProvider, trace::SdkTracerProvider};
+use opentelemetry_semantic_conventions::resource::SERVICE_NAME;
+use tracing::{Metadata, Subscriber, info, level_filters::LevelFilter, span, subscriber::Interest, warn};
 use tracing_subscriber::{
     EnvFilter, Registry,
     filter::Filtered,
     fmt::{
-        Layer,
-        format::{FmtSpan, Format, Json, JsonFields},
+        FmtContext, FormatEvent, FormatFields, FormattedFields, Layer,
+        format::{FmtSpan, Format, Json, JsonFields, Writer},
     },
-    layer::{Layered, SubscriberExt},
+    layer::{Context, Filter, Layered, SubscriberExt},
     prelude::*,
+    registry::LookupSpan,
     util::SubscriberInitExt,
 };
 
 const AMARU_LOG_VAR: &str = "AMARU_LOG";
 
-const DEFAULT_AMARU_LOG_FILTER: &str = "error,amaru=debug,amaru::ledger::state::rewards=off,amaru::ledger::state::stake_distribution=off";
+const DEFAULT_AMARU_LOG_FILTER: &str = "info,amaru::consensus=debug,amaru::ledger=debug,pure_stage=warn";
 
 const AMARU_TRACE_VAR: &str = "AMARU_TRACE";
 
-const DEFAULT_AMARU_TRACE_FILTER: &str = "amaru=trace";
+const DEFAULT_AMARU_TRACE_FILTER: &str = "amaru=trace,pure_stage=trace,amaru_protocols=warn,amaru_consensus=info";
+
+const OTEL_ERROR_THROTTLE_MS: u64 = 5_000;
 
 // -----------------------------------------------------------------------------
 // TracingSubscriber
@@ -48,17 +57,76 @@ const DEFAULT_AMARU_TRACE_FILTER: &str = "amaru=trace";
 
 type OpenTelemetryLayer<S> = Layered<OpenTelemetryFilter<S>, S>;
 
-type OpenTelemetryFilter<S> = Filtered<
-    tracing_opentelemetry::OpenTelemetryLayer<S, opentelemetry_sdk::trace::Tracer>,
-    EnvFilter,
-    S,
->;
+type OpenTelemetryFilter<S> =
+    Filtered<tracing_opentelemetry::OpenTelemetryLayer<S, opentelemetry_sdk::trace::Tracer>, ThrottledEnvFilter, S>;
 
 type JsonLayer<S> = Layered<JsonFilter<S>, S>;
 
-type JsonFilter<S> = Filtered<Layer<S, JsonFields, Format<Json>>, EnvFilter, S>;
+type JsonFilter<S> = Filtered<Layer<S, JsonFields, SpanJsonFormat>, ThrottledEnvFilter, S>;
 
 type DelayedWarning = Option<Box<dyn FnOnce()>>;
+
+// -----------------------------------------------------------------------------
+// SpanJsonFormat
+//
+// Wraps the standard JSON formatter to inject `id` and `parent_id` top-level
+// fields into span lifecycle events (enter/exit). Regular log events are left
+// untouched.
+// -----------------------------------------------------------------------------
+
+pub struct SpanJsonFormat(Format<Json>);
+
+impl<S, N> FormatEvent<S, N> for SpanJsonFormat
+where
+    S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+    N: for<'a> FormatFields<'a> + 'static,
+{
+    fn format_event(
+        &self,
+        ctx: &FmtContext<'_, S, N>,
+        mut writer: Writer<'_>,
+        event: &tracing::Event<'_>,
+    ) -> fmt::Result {
+        // Render the event with the inner JSON formatter into a buffer
+        let mut buf = String::new();
+        self.0.format_event(ctx, Writer::new(&mut buf), event)?;
+
+        // Inject span-related fields before the closing '}'.
+        //  - Span lifecycle events (enter/exit): get `id`, `parent_id`, and recorded fields.
+        //  - Log events emitted inside a span: get `parent_id` only.
+        if let Some(current) = ctx.lookup_current()
+            && let Some(pos) = buf.rfind('}')
+        {
+            let mut extra = String::new();
+
+            // Inject recorded span fields (stored by the fmt layer as FormattedFields).
+            let extensions = current.extensions();
+            if let Some(fields) = extensions.get::<FormattedFields<JsonFields>>() {
+                let s = fields.as_str().trim();
+                // Strip outer braces from JSON object: {"k":v,...} -> "k":v,...
+                let inner = s.strip_prefix('{').and_then(|s| s.strip_suffix('}')).unwrap_or(s);
+                if !inner.is_empty() {
+                    extra.push(',');
+                    extra.push_str(inner);
+                }
+            }
+
+            if event.metadata().is_span() {
+                let id = current.id().into_u64();
+                extra.push_str(&format!(",\"id\":{id}"));
+            }
+            if let Some(parent) = current.parent() {
+                let parent_id = parent.id().into_u64();
+                extra.push_str(&format!(",\"parent_id\":{parent_id}"));
+            }
+            if !extra.is_empty() {
+                buf.insert_str(pos, &extra);
+            }
+        }
+
+        writer.write_str(&buf)
+    }
+}
 
 #[expect(clippy::large_enum_variant)]
 #[derive(Default)]
@@ -109,26 +177,19 @@ impl TracingSubscriber<Registry> {
         }
     }
 
-    pub fn init(self) {
-        self.init_with_rewards_file(None)
+    pub fn init(self, color: bool) {
+        self.init_with_file_loggers(None, None, color)
     }
-    
-    pub fn init_with_rewards_file(self, rewards_file_path: Option<std::path::PathBuf>) {
-        self.init_with_file_loggers(rewards_file_path, None)
-    }
-    
+
     pub fn init_with_file_loggers(
-        self, 
+        self,
         rewards_file_path: Option<std::path::PathBuf>,
         snapshot_file_path: Option<std::path::PathBuf>,
+        color: bool,
     ) {
         let (default_filter, warning) = new_default_filter(AMARU_LOG_VAR, DEFAULT_AMARU_LOG_FILTER);
 
-        let log_format = || {
-            tracing_subscriber::fmt::format()
-                .with_ansi(io::stderr().is_terminal())
-                .compact()
-        };
+        let log_format = || tracing_subscriber::fmt::format().with_ansi(color).compact();
         let log_writer = || io::stderr as fn() -> io::Stderr;
         let log_events = || FmtSpan::CLOSE;
         let log_filter = || default_filter;
@@ -237,14 +298,10 @@ impl TracingSubscriber<Registry> {
 
 // -----------------------------------------------------------------------------
 // JSON TRACES
-// -----------------------------------------------------------------------------
+// ---------------------------------------------------------------------------------
 
 pub fn setup_json_traces(subscriber: &mut TracingSubscriber<Registry>) -> DelayedWarning {
-    let format = || {
-        tracing_subscriber::fmt::format()
-            .json()
-            .with_span_list(false)
-    };
+    let format = || SpanJsonFormat(tracing_subscriber::fmt::format().json().with_span_list(false));
     let events = || FmtSpan::ENTER | FmtSpan::EXIT;
     let filter = || new_default_filter(AMARU_TRACE_VAR, DEFAULT_AMARU_TRACE_FILTER);
 
@@ -253,9 +310,9 @@ pub fn setup_json_traces(subscriber: &mut TracingSubscriber<Registry>) -> Delaye
             let (default_filter, warning) = filter();
             (
                 tracing_subscriber::fmt::layer()
+                    .with_span_events(events())
                     .event_format(format())
                     .fmt_fields(JsonFields::new())
-                    .with_span_events(events())
                     .with_filter(default_filter),
                 warning,
             )
@@ -264,9 +321,9 @@ pub fn setup_json_traces(subscriber: &mut TracingSubscriber<Registry>) -> Delaye
             let (default_filter, warning) = filter();
             (
                 tracing_subscriber::fmt::layer()
+                    .with_span_events(events())
                     .event_format(format())
                     .fmt_fields(JsonFields::new())
-                    .with_span_events(events())
                     .with_filter(default_filter),
                 warning,
             )
@@ -287,51 +344,21 @@ impl Default for OpenTelemetryHandle {
     fn default() -> Self {
         OpenTelemetryHandle {
             metrics: None::<SdkMeterProvider>,
-            teardown: Box::new(|| Ok(()))
-                as Box<dyn FnOnce() -> Result<(), Box<dyn std::error::Error>>>,
+            teardown: Box::new(|| Ok(())) as Box<dyn FnOnce() -> Result<(), Box<dyn std::error::Error>>>,
         }
     }
 }
 
 pub const DEFAULT_OTLP_SERVICE_NAME: &str = "amaru";
 
-pub const DEFAULT_OTLP_SPAN_URL: &str = "http://localhost:4317";
-
 pub const DEFAULT_OTLP_METRIC_URL: &str = "http://localhost:4318/v1/metrics";
 
-/// Configuration for OpenTelemetry tracing layer.
-pub struct OpenTelemetryConfig {
-    /// Uniquely identifies this particular instance of Amaru
-    pub service_name: String,
-
-    /// URL for exporting OTLP spans and traces
-    pub span_url: String,
-
-    /// URL for exporting OTLP metrics
-    pub metric_url: String,
-}
-
-impl Default for OpenTelemetryConfig {
-    fn default() -> Self {
-        OpenTelemetryConfig {
-            service_name: DEFAULT_OTLP_SERVICE_NAME.to_string(),
-            span_url: DEFAULT_OTLP_SPAN_URL.to_string(),
-            metric_url: DEFAULT_OTLP_METRIC_URL.to_string(),
-        }
-    }
-}
-
 #[expect(clippy::panic)]
-pub fn setup_open_telemetry(
-    config: &OpenTelemetryConfig,
-    subscriber: &mut TracingSubscriber<Registry>,
-) -> (OpenTelemetryHandle, DelayedWarning) {
+pub fn setup_open_telemetry(subscriber: &mut TracingSubscriber<Registry>) -> (OpenTelemetryHandle, DelayedWarning) {
     use opentelemetry::KeyValue;
     use opentelemetry_sdk::{Resource, metrics::Temporality};
 
-    let resource = Resource::builder()
-        .with_attribute(KeyValue::new("service.name", config.service_name.clone()))
-        .build();
+    let resource = Resource::builder().with_attribute(KeyValue::new(SERVICE_NAME, DEFAULT_OTLP_SERVICE_NAME)).build();
 
     // Traces & span
     let opentelemetry_provider = SdkTracerProvider::builder()
@@ -339,7 +366,6 @@ pub fn setup_open_telemetry(
         .with_batch_exporter(
             opentelemetry_otlp::SpanExporter::builder()
                 .with_tonic()
-                .with_endpoint(config.span_url.clone())
                 .build()
                 .unwrap_or_else(|e| panic!("failed to setup opentelemetry span exporter: {e}")),
         )
@@ -350,13 +376,14 @@ pub fn setup_open_telemetry(
     // support gRPC for metrics.
     let metric_exporter = opentelemetry_otlp::MetricExporter::builder()
         .with_http()
-        .with_endpoint(config.metric_url.clone())
+        .with_endpoint(DEFAULT_OTLP_METRIC_URL)
         .with_temporality(Temporality::default())
         .build()
         .unwrap_or_else(|e| panic!("unable to create metric exporter: {e:?}"));
 
-    let metric_reader =
-        opentelemetry_sdk::metrics::PeriodicReader::builder(metric_exporter).build();
+    let metric_reader = opentelemetry_sdk::metrics::PeriodicReader::builder(metric_exporter)
+        .with_interval(Duration::from_secs(10))
+        .build();
 
     let metrics_provider = opentelemetry_sdk::metrics::SdkMeterProvider::builder()
         .with_reader(metric_reader)
@@ -367,22 +394,18 @@ pub fn setup_open_telemetry(
     opentelemetry::global::set_meter_provider(metrics_provider.clone());
 
     // Subscriber
-    let opentelemetry_tracer = opentelemetry_provider.tracer(config.service_name.clone());
+    let opentelemetry_tracer = opentelemetry_provider.tracer(DEFAULT_OTLP_SERVICE_NAME);
     let (default_filter, warning) = new_default_filter(AMARU_TRACE_VAR, DEFAULT_AMARU_TRACE_FILTER);
 
-    let opentelemetry_layer = tracing_opentelemetry::layer()
-        .with_tracer(opentelemetry_tracer)
-        .with_level(true)
-        .with_filter(default_filter);
+    let opentelemetry_layer =
+        tracing_opentelemetry::layer().with_tracer(opentelemetry_tracer).with_level(true).with_filter(default_filter);
 
     subscriber.with_open_telemetry(opentelemetry_layer);
 
     (
         OpenTelemetryHandle {
             metrics: Some(metrics_provider.clone()),
-            teardown: Box::new(|| {
-                teardown_open_telemetry(opentelemetry_provider, metrics_provider)
-            }),
+            teardown: Box::new(|| teardown_open_telemetry(opentelemetry_provider, metrics_provider)),
         },
         warning,
     )
@@ -404,25 +427,326 @@ fn teardown_open_telemetry(
 // ENV FILTER
 // -----------------------------------------------------------------------------
 
-fn new_default_filter(var: &str, default: &str) -> (EnvFilter, DelayedWarning) {
-    match EnvFilter::try_from_env(var) {
-        Ok(filter) => (filter, None),
+/// Wraps an [`EnvFilter`] and rate-limits events emitted by OpenTelemetry SDK
+/// internals (target `opentelemetry*`) to at most one per `throttle_ms`
+/// milliseconds. This prevents the console from being flooded with
+/// `BatchSpanProcessor.ExportError` messages whenever the OTLP endpoint is
+/// temporarily unreachable.
+pub struct ThrottledEnvFilter {
+    inner: EnvFilter,
+    last_otel_event: AtomicU64,
+    throttle_ms: u64,
+}
+
+impl ThrottledEnvFilter {
+    fn new(inner: EnvFilter, throttle_ms: u64) -> Self {
+        Self { inner, last_otel_event: AtomicU64::new(0), throttle_ms }
+    }
+
+    /// Returns true for events emitted by the OpenTelemetry SDK itself.
+    /// These are the ones we want to throttle to avoid log flooding when the
+    /// OTLP endpoint is unreachable.
+    fn is_otel_internal(meta: &Metadata<'_>) -> bool {
+        meta.target().starts_with("opentelemetry")
+    }
+}
+
+impl<S: Subscriber> Filter<S> for ThrottledEnvFilter {
+    fn enabled(&self, meta: &Metadata<'_>, cx: &Context<'_, S>) -> bool {
+        if !<EnvFilter as Filter<S>>::enabled(&self.inner, meta, cx) {
+            return false;
+        }
+        if Self::is_otel_internal(meta) {
+            // If the system clock is before the Unix epoch, allow the event
+            // through rather than freezing throttling forever at timestamp 0.
+            let Some(now) = SystemTime::now().duration_since(UNIX_EPOCH).ok().map(|d| d.as_millis() as u64) else {
+                return true;
+            };
+            // Use fetch_update so the read-check-write is one atomic step.
+            // A race between threads that both observe an elapsed throttle period
+            // may let a small number of extra events through (false positives), but
+            // that is acceptable — we only need best-effort throttling here.
+            return self
+                .last_otel_event
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
+                    (now.saturating_sub(last) >= self.throttle_ms).then_some(now)
+                })
+                .is_ok();
+        }
+        true
+    }
+
+    fn callsite_enabled(&self, meta: &'static Metadata<'static>) -> Interest {
+        // For OTel internal events, force per-call evaluation so that the
+        // throttle in `enabled` is never bypassed by callsite caching.
+        if Self::is_otel_internal(meta) {
+            return Interest::sometimes();
+        }
+        <EnvFilter as Filter<S>>::callsite_enabled(&self.inner, meta)
+    }
+
+    fn max_level_hint(&self) -> Option<LevelFilter> {
+        <EnvFilter as Filter<S>>::max_level_hint(&self.inner)
+    }
+
+    fn on_new_span(&self, attrs: &span::Attributes<'_>, id: &span::Id, ctx: Context<'_, S>) {
+        <EnvFilter as Filter<S>>::on_new_span(&self.inner, attrs, id, ctx);
+    }
+
+    fn on_record(&self, id: &span::Id, values: &span::Record<'_>, ctx: Context<'_, S>) {
+        <EnvFilter as Filter<S>>::on_record(&self.inner, id, values, ctx);
+    }
+
+    fn on_enter(&self, id: &span::Id, ctx: Context<'_, S>) {
+        <EnvFilter as Filter<S>>::on_enter(&self.inner, id, ctx);
+    }
+
+    fn on_exit(&self, id: &span::Id, ctx: Context<'_, S>) {
+        <EnvFilter as Filter<S>>::on_exit(&self.inner, id, ctx);
+    }
+
+    fn on_close(&self, id: span::Id, ctx: Context<'_, S>) {
+        <EnvFilter as Filter<S>>::on_close(&self.inner, id, ctx);
+    }
+}
+
+fn new_default_filter(var: &str, default: &str) -> (ThrottledEnvFilter, DelayedWarning) {
+    let (filter, warning) = match EnvFilter::try_from_env(var) {
+        Ok(filter) => {
+            let var = var.to_string();
+            let value = std::env::var(&var).unwrap_or_default();
+            let notice = Box::new(move || info!(var, value, "using ENV variable")) as Box<dyn FnOnce()>;
+            (filter, Some(notice))
+        }
         Err(e) => {
             // Notice stashed for when the tracing system is up.
             let fallback = default.to_string();
             let var = var.to_string();
             let warning = match e.source().and_then(|e| e.downcast_ref::<VarError>()) {
                 Some(VarError::NotPresent) => {
-                    Box::new(move || info!(var, fallback, "unspecified ENV variable"))
-                        as Box<dyn FnOnce()>
+                    Box::new(move || info!(var, fallback, "unspecified ENV variable")) as Box<dyn FnOnce()>
                 }
-                _ => Box::new(move || warn!(var, fallback, reason = %e, "invalid ENV variable"))
-                    as Box<dyn FnOnce()>,
+                _ => Box::new(move || warn!(var, fallback, reason = %e, "invalid ENV variable")) as Box<dyn FnOnce()>,
             };
 
             #[expect(clippy::expect_used)]
             let filter = EnvFilter::try_new(default).expect("invalid default filter");
             (filter, Some(warning))
         }
+    };
+    (ThrottledEnvFilter::new(filter, OTEL_ERROR_THROTTLE_MS), warning)
+}
+
+pub fn setup_observability(
+    with_open_telemetry: bool,
+    with_json_traces: bool,
+    color: bool,
+    rewards_file_path: Option<std::path::PathBuf>,
+    snapshot_file_path: Option<std::path::PathBuf>,
+) -> (Option<SdkMeterProvider>, Box<dyn FnOnce() -> Result<(), Box<dyn std::error::Error>>>) {
+    let mut subscriber = TracingSubscriber::new();
+
+    let (OpenTelemetryHandle { metrics, teardown }, warning_otlp) = if with_open_telemetry {
+        setup_open_telemetry(&mut subscriber)
+    } else {
+        (OpenTelemetryHandle::default(), None)
+    };
+
+    let warning_json = if with_json_traces { setup_json_traces(&mut subscriber) } else { None };
+
+    subscriber.init_with_file_loggers(rewards_file_path, snapshot_file_path, color);
+
+    // NOTE: Both warnings are bound to the same ENV var, so `.or` prevents from logging it twice.
+    if let Some(notify) = warning_otlp.or(warning_json) {
+        notify();
+    }
+
+    (metrics, teardown)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Color {
+    Never,
+    Always,
+    Auto,
+}
+impl FromStr for Color {
+    type Err = &'static str;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "never" => Ok(Color::Never),
+            "always" => Ok(Color::Always),
+            "auto" => Ok(Color::Auto),
+            _ => Err("valid color settings are 'never', 'always' or 'auto'"),
+        }
+    }
+}
+impl Color {
+    pub fn is_enabled(this: Option<Self>) -> bool {
+        match this {
+            Some(Color::Never) => false,
+            Some(Color::Always) => true,
+            Some(Color::Auto) => std::io::stderr().is_terminal(),
+            None => {
+                if std::env::var("NO_COLOR").iter().any(|s| !s.is_empty()) {
+                    false
+                } else {
+                    std::io::stderr().is_terminal()
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering as AtomicOrdering},
+    };
+
+    use super::*;
+
+    /// Builds a subscriber that wraps a `ThrottledEnvFilter` and counts how
+    /// many events pass the filter.  Installing it as the default inside a
+    /// closure keeps tests independent even when run in parallel.
+    struct CountingLayer {
+        count: Arc<AtomicUsize>,
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CountingLayer {
+        fn on_event(&self, _event: &tracing::Event<'_>, _ctx: tracing_subscriber::layer::Context<'_, S>) {
+            self.count.fetch_add(1, AtomicOrdering::Relaxed);
+        }
+    }
+
+    /// Runs `f` with a subscriber that applies `filter` and returns the number
+    /// of events that were seen by the inner layer.
+    fn count_events<F: FnOnce()>(filter: ThrottledEnvFilter, f: F) -> usize {
+        let count = Arc::new(AtomicUsize::new(0));
+        let subscriber =
+            tracing_subscriber::registry().with(CountingLayer { count: Arc::clone(&count) }.with_filter(filter));
+        tracing::subscriber::with_default(subscriber, f);
+        count.load(AtomicOrdering::Relaxed)
+    }
+
+    #[test]
+    fn otel_target_is_recognised_as_internal() {
+        // Use the actual tracing machinery to produce `Metadata` with a known
+        // target and level, then check `is_otel_internal` on it.
+        static CHECK: Mutex<Option<bool>> = Mutex::new(None);
+
+        struct CaptureMeta;
+        impl tracing::Subscriber for CaptureMeta {
+            fn enabled(&self, meta: &tracing::Metadata<'_>) -> bool {
+                if meta.target().starts_with("opentelemetry") {
+                    *CHECK.lock().unwrap() = Some(ThrottledEnvFilter::is_otel_internal(meta));
+                }
+                true
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn event(&self, _: &tracing::Event<'_>) {}
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+
+        tracing::subscriber::with_default(CaptureMeta, || {
+            tracing::event!(target: "opentelemetry_sdk::internal", tracing::Level::ERROR, "test");
+        });
+
+        assert_eq!(*CHECK.lock().unwrap(), Some(true));
+    }
+
+    #[test]
+    fn non_otel_target_is_not_recognised_as_internal() {
+        static CHECK: Mutex<Option<bool>> = Mutex::new(None);
+
+        struct CaptureMeta;
+        impl tracing::Subscriber for CaptureMeta {
+            fn enabled(&self, meta: &tracing::Metadata<'_>) -> bool {
+                if meta.target() == "amaru::stages" {
+                    *CHECK.lock().unwrap() = Some(ThrottledEnvFilter::is_otel_internal(meta));
+                }
+                true
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn event(&self, _: &tracing::Event<'_>) {}
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+
+        tracing::subscriber::with_default(CaptureMeta, || {
+            tracing::event!(target: "amaru::stages", tracing::Level::DEBUG, "test");
+        });
+
+        assert_eq!(*CHECK.lock().unwrap(), Some(false));
+    }
+
+    #[test]
+    fn first_otel_event_is_allowed() {
+        // last_otel_event starts at 0, so the first event always passes.
+        let filter = ThrottledEnvFilter::new(EnvFilter::try_new("error").unwrap(), 1_000);
+        let seen = count_events(filter, || {
+            tracing::event!(target: "opentelemetry_sdk::internal", tracing::Level::ERROR, "test");
+        });
+        assert_eq!(seen, 1);
+    }
+
+    #[test]
+    fn second_otel_event_within_throttle_is_rejected() {
+        let filter = ThrottledEnvFilter::new(EnvFilter::try_new("error").unwrap(), 1_000);
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+        // Pre-load `last_otel_event` as if an event was just allowed.
+        filter.last_otel_event.store(now, Ordering::Relaxed);
+
+        let seen = count_events(filter, || {
+            tracing::event!(target: "opentelemetry_sdk::internal", tracing::Level::ERROR, "test");
+        });
+        assert_eq!(seen, 0);
+    }
+
+    #[test]
+    fn otel_event_after_throttle_period_is_allowed() {
+        let throttle_ms = 1_000u64;
+        let filter = ThrottledEnvFilter::new(EnvFilter::try_new("error").unwrap(), throttle_ms);
+        let past = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64 - throttle_ms - 1;
+        filter.last_otel_event.store(past, Ordering::Relaxed);
+
+        let seen = count_events(filter, || {
+            tracing::event!(target: "opentelemetry_sdk::internal", tracing::Level::ERROR, "test");
+        });
+        assert_eq!(seen, 1);
+    }
+
+    #[test]
+    fn non_otel_event_is_not_throttled() {
+        let filter = ThrottledEnvFilter::new(EnvFilter::try_new("debug").unwrap(), 1_000);
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+        filter.last_otel_event.store(now, Ordering::Relaxed);
+
+        let seen = count_events(filter, || {
+            // Non-otel target — throttle must not apply.
+            tracing::debug!(target: "amaru::stages", "test");
+        });
+        assert_eq!(seen, 1);
+    }
+
+    #[test]
+    fn throttle_period_advances_after_allowed_event() {
+        let filter = ThrottledEnvFilter::new(EnvFilter::try_new("error").unwrap(), 100);
+        // Emit two events in rapid succession; only the first should be seen.
+        let seen = count_events(filter, || {
+            tracing::event!(target: "opentelemetry_sdk::internal", tracing::Level::ERROR, "first");
+            tracing::event!(target: "opentelemetry_sdk::internal", tracing::Level::ERROR, "second");
+        });
+        assert_eq!(seen, 1);
     }
 }

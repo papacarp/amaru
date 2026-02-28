@@ -12,15 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::rocksdb::{PREFIX_LEN, as_value, dreps};
+use std::collections::BTreeSet;
+
 use ::rocksdb::{Direction, IteratorMode, ReadOptions, Transaction};
 use amaru_kernel::{
-    CertificatePointer, DRep, StakeCredential, StakeCredentialType, display_collection,
-    stake_credential_hash,
+    AsHash, CertificatePointer, DRep, StakeCredential, StakeCredentialKind, utils::string::display_collection,
 };
 use amaru_ledger::store::{StoreError, columns::unsafe_decode};
-use std::collections::BTreeSet;
-use tracing::{Level, debug, instrument, warn};
+use amaru_observability::trace;
+use tracing::{debug, warn};
+
+use crate::rocksdb::{PREFIX_LEN, as_value, dreps};
 
 /// Name prefixed used for storing Account -> DRep & DRep -> Account entries. UTF-8 encoding for
 /// "dlg".
@@ -79,23 +81,22 @@ pub fn add<DB>(
                 && previous_deregistration > delegator_since
             {
                 debug!(
-                    drep.type = %StakeCredentialType::from(&drep),
-                    drep.hash = %stake_credential_hash(&drep),
-                    delegator.type = %StakeCredentialType::from(&delegator),
-                    delegator.hash = %stake_credential_hash(&delegator),
+                    drep.type = %StakeCredentialKind::from(&drep),
+                    drep.hash = %drep.as_hash(),
+                    delegator.type = %StakeCredentialKind::from(&delegator),
+                    delegator.hash = %delegator.as_hash(),
                     "drep has unregistered since delegation; skipping mapping",
                 );
                 continue;
             }
 
-            db.put(new_key(&drep, &delegator), vec![])
-                .map_err(|err| StoreError::Internal(err.into()))?;
+            db.put(new_key(&drep, &delegator), vec![]).map_err(|err| StoreError::Internal(err.into()))?;
         } else {
             warn!(
-                drep.type = %StakeCredentialType::from(&drep),
-                drep.hash = %stake_credential_hash(&drep),
-                delegator.type = %StakeCredentialType::from(&delegator),
-                delegator.hash = %stake_credential_hash(&delegator),
+                drep.type = %StakeCredentialKind::from(&drep),
+                drep.hash = %drep.as_hash(),
+                delegator.type = %StakeCredentialKind::from(&delegator),
+                delegator.hash = %delegator.as_hash(),
                 "delegator was delegated to non-existing drep",
             );
         }
@@ -105,36 +106,23 @@ pub fn add<DB>(
 }
 
 /// Forget about a past link between a drep and its delegator, if any.
-pub fn remove<DB>(
-    db: &Transaction<'_, DB>,
-    drep: &DRep,
-    delegator: &StakeCredential,
-) -> Result<(), StoreError> {
+pub fn remove<DB>(db: &Transaction<'_, DB>, drep: &DRep, delegator: &StakeCredential) -> Result<(), StoreError> {
     let drep = match drep {
         DRep::Key(hash) => StakeCredential::AddrKeyhash(*hash),
         DRep::Script(hash) => StakeCredential::ScriptHash(*hash),
         DRep::Abstain | DRep::NoConfidence => return Ok(()),
     };
 
-    db.delete(new_key(&drep, delegator))
-        .map_err(|err| StoreError::Internal(err.into()))
+    db.delete(new_key(&drep, delegator)).map_err(|err| StoreError::Internal(err.into()))
 }
 
 /// Forget about ALL bindings for a given drep, returning all known (past and present) delegations
 /// for that drep.
-#[instrument(
-    level = Level::DEBUG,
-    name = "dreps_delegations.remove",
-    skip_all,
-    fields(
-        drep.hash = %stake_credential_hash(drep),
-        drep.type = %StakeCredentialType::from(drep),
-    )
+#[trace(amaru::stores::ledger::DREPS_DELEGATION_REMOVE,
+    drep_hash = drep.as_hash(),
+    drep_type = StakeCredentialKind::from(drep)
 )]
-pub fn drop<DB>(
-    db: &Transaction<'_, DB>,
-    drep: &StakeCredential,
-) -> Result<BTreeSet<StakeCredential>, StoreError> {
+pub fn drop<DB>(db: &Transaction<'_, DB>, drep: &StakeCredential) -> Result<BTreeSet<StakeCredential>, StoreError> {
     let mut delegators = BTreeSet::new();
 
     let keys = iter_drep(db, drep)
@@ -147,21 +135,12 @@ pub fn drop<DB>(
         .collect::<Result<Vec<_>, _>>()
         .map_err(|err| StoreError::Internal(err.into()))?;
 
-    keys.iter()
-        .try_for_each(|key| db.delete(key))
-        .map_err(|err| StoreError::Internal(err.into()))?;
+    keys.iter().try_for_each(|key| db.delete(key)).map_err(|err| StoreError::Internal(err.into()))?;
 
     if !delegators.is_empty() {
         debug!(
-            delegators = format!(
-                "[{}]",
-                display_collection(
-                    delegators
-                        .iter()
-                        .map(stake_credential_hash)
-                        .collect::<Vec<_>>()
-                )
-            ),
+            delegators =
+                format!("[{}]", display_collection(delegators.iter().map(AsHash::as_hash).collect::<Vec<_>>())),
             "clearing present (and past) delegators"
         )
     }
@@ -187,14 +166,13 @@ fn iter_drep<DB>(
     opts.set_prefix_same_as_start(true);
     opts.set_iterate_upper_bound(upper_bound); // is exclusive
 
-    db.iterator_opt(IteratorMode::From(&prefix[..], Direction::Forward), opts)
-        .map(move |item| {
-            item.map(|(key, _)| {
-                let (_, right) = key.split_at(prefix.len());
-                let delegator = unsafe_decode::<StakeCredential>(right.to_vec());
-                (key, delegator)
-            })
+    db.iterator_opt(IteratorMode::From(&prefix[..], Direction::Forward), opts).map(move |item| {
+        item.map(|(key, _)| {
+            let (_, right) = key.split_at(prefix.len());
+            let delegator = unsafe_decode::<StakeCredential>(right);
+            (key, delegator)
         })
+    })
 }
 
 /// Construct a drep delegation key from the drep and delegator respective stake credentials:
@@ -223,10 +201,7 @@ fn new_key(drep: &StakeCredential, delegator: &StakeCredential) -> Vec<u8> {
 pub fn into_next_prefix(mut bytes: Vec<u8>) -> Vec<u8> {
     let mut i = bytes.len();
 
-    debug_assert!(
-        i > 1,
-        "into_next_prefix called with empty or singleton bytes"
-    );
+    debug_assert!(i > 1, "into_next_prefix called with empty or singleton bytes");
 
     while i > 0 {
         i -= 1;
@@ -236,10 +211,7 @@ pub fn into_next_prefix(mut bytes: Vec<u8>) -> Vec<u8> {
         }
     }
 
-    debug_assert!(
-        i > 0,
-        "into_next_prefix called with saturated bytes (i.e. all 0xFF)"
-    );
+    debug_assert!(i > 0, "into_next_prefix called with saturated bytes (i.e. all 0xFF)");
 
     bytes
 }

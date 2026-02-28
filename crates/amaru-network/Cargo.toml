@@ -13,24 +13,24 @@ documentation.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-acto.workspace = true
-anyhow.workspace = true
-async-trait.workspace = true
-binrw.workspace = true
-bytes.workspace = true
-futures-util.workspace = true
+bytes = { workspace = true, features = ["serde"] }
 pallas-network.workspace = true
 pallas-traverse.workspace = true
 parking_lot.workspace = true
 pure-stage.workspace = true
+socket2.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["net"] }
 tracing.workspace = true
 
 amaru-kernel.workspace = true
+amaru-observability.workspace = true
 amaru-ouroboros.workspace = true
-amaru-ouroboros-traits.workspace = true
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt", "macros"] }
+anyhow.workspace = true
+amaru-mempool.workspace = true
+hex.workspace = true
+proptest.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 tracing-subscriber.workspace = true

@@ -12,84 +12,118 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::cmd::default_chain_dir;
-use crate::pid::with_optional_pid_file;
-use crate::{cmd::default_ledger_dir, metrics::track_system_metrics};
-use amaru::stages::{Config, MaxExtraLedgerSnapshots, StoreType, bootstrap};
-use amaru_kernel::network::NetworkName;
-use amaru_kernel::peer::Peer;
+use std::path::PathBuf;
+
+use amaru::{
+    DEFAULT_LISTEN_ADDRESS, DEFAULT_NETWORK, DEFAULT_PEER_ADDRESS, default_chain_dir, default_ledger_dir,
+    metrics::track_system_metrics,
+    stages::{
+        build_node::build_and_run_node,
+        config::{Config, MaxExtraLedgerSnapshots, StoreType},
+    },
+};
+use amaru_kernel::NetworkName;
 use amaru_stores::rocksdb::RocksDbConfig;
 use clap::{ArgAction, Parser};
 use opentelemetry_sdk::metrics::SdkMeterProvider;
-use std::path::PathBuf;
 use thiserror::Error;
 use tracing::{error, info, warn};
 
+use crate::pid::with_optional_pid_file;
+
 #[derive(Debug, Parser)]
 pub struct Args {
-    /// Upstream peer addresses to synchronize from.
+    /// Path of the chain on-disk storage.
     ///
-    /// This option can be specified multiple times to connect to multiple peers.
-    /// At least one peer address must be specified.
-    #[arg(long, value_name = "NETWORK_ADDRESS", default_value = super::DEFAULT_PEER_ADDRESS, env = "AMARU_PEER_ADDRESS",
-        action = ArgAction::Append, required = true, value_delimiter = ',')]
-    peer_address: Vec<String>,
-
-    /// The target network to choose from.
-    ///
-    /// Should be one of 'mainnet', 'preprod', 'preview' or 'testnet_<magic>' where
-    /// `magic` is a 32-bits unsigned value denoting a particular testnet.
+    /// Defaults to ./chain.<NETWORK>.db when unspecified.
     #[arg(
         long,
-        value_name = "NETWORK",
-        env = "AMARU_NETWORK",
-        default_value_t = super::DEFAULT_NETWORK,
+        value_name = amaru::value_names::DIRECTORY,
+        env = amaru::env_vars::CHAIN_DIR,
     )]
-    network: NetworkName,
-
-    /// Path of the ledger on-disk storage.
-    #[arg(long, value_name = "DIR", env = "AMARU_LEDGER_DIR")]
-    ledger_dir: Option<PathBuf>,
-
-    /// Path of the chain on-disk storage.
-    #[arg(long, value_name = "DIR", env = "AMARU_CHAIN_DIR")]
     chain_dir: Option<PathBuf>,
 
+    /// Path of the ledger on-disk storage.
+    ///
+    /// Defaults to ./ledger.<NETWORK>.db when unspecified.
+    #[arg(
+        long,
+        value_name = amaru::value_names::DIRECTORY,
+        env = amaru::env_vars::LEDGER_DIR,
+    )]
+    ledger_dir: Option<PathBuf>,
+
     /// The address to listen on for incoming connections.
-    #[arg(long, value_name = "NETWORK_ADDRESS", env = "AMARU_LISTEN_ADDRESS", default_value = super::DEFAULT_LISTEN_ADDRESS
+    #[arg(
+        long,
+        value_name = amaru::value_names::ENDPOINT,
+        env = amaru::env_vars::LISTEN_ADDRESS,
+        default_value = DEFAULT_LISTEN_ADDRESS,
     )]
     listen_address: String,
 
     /// The maximum number of downstream peers to connect to.
     #[arg(
         long,
-        value_name = "MAX_DOWNSTREAM_PEERS",
-        env = "AMARU_MAX_DOWNSTREAM_PEERS",
+        value_name = amaru::value_names::UINT,
+        env = amaru::env_vars::MAX_DOWNSTREAM_PEERS,
         default_value_t = 10
     )]
     max_downstream_peers: usize,
 
-    /// The maximum number of additional ledger snapshots to keep around. By default, Amaru only
-    /// keeps the strict minimum of what's needed to operate.
+    /// The maximum number of additional ledger snapshots to keep around.
+    ///
+    /// By default, Amaru only keeps the strict minimum of what's needed to operate.
     ///
     /// Should be a whole number >=0 or the string 'all' to keep all historical ledger snapshots
     /// (~2GB per epoch on Mainnet).
     #[arg(
         long,
-        value_name = "MAX_EXTRA_LEDGER_SNAPSHOTS",
-        env = "AMARU_MAX_EXTRA_LEDGER_SNAPSHOTS",
+        value_name = amaru::value_names::UINT_ALL,
+        env = amaru::env_vars::MAX_EXTRA_LEDGER_SNAPSHOTS,
         default_value_t = MaxExtraLedgerSnapshots::default(),
     )]
     max_extra_ledger_snapshots: MaxExtraLedgerSnapshots,
 
-    /// Path to the PID file, managed by Amaru.
-    #[arg(long, value_name = "FILE", env = "AMARU_PID_FILE")]
-    pid_file: Option<PathBuf>,
-
     /// Flag to automatically migrate the chain database if needed.
+    ///
     /// By default, the migration is not performed automatically, checkout `migrate-chain-db` command.
-    #[arg(long, action = ArgAction::SetTrue, default_value_t = false, env = "AMARU_MIGRATE_CHAIN_DB")]
+    #[arg(
+        long,
+        env = amaru::env_vars::MIGRATE_CHAIN_DB,
+        action = ArgAction::SetTrue,
+        default_value_t = false,
+    )]
     migrate_chain_db: bool,
+
+    /// The target network to run against.
+    #[arg(
+        long,
+        value_name = amaru::value_names::NETWORK,
+        env = amaru::env_vars::NETWORK,
+        default_value_t = DEFAULT_NETWORK,
+    )]
+    network: NetworkName,
+
+    /// Upstream peer addresses to synchronize from.
+    #[arg(
+        long,
+        value_name = amaru::value_names::ENDPOINT,
+        env = amaru::env_vars::PEER_ADDRESS,
+        default_value = DEFAULT_PEER_ADDRESS,
+        action = ArgAction::Append,
+        value_delimiter = ',',
+        num_args(0..),
+    )]
+    peer_address: Vec<String>,
+
+    /// Path to the PID file managed by Amaru.
+    #[arg(
+        long,
+        value_name = amaru::value_names::FILEPATH,
+        env = amaru::env_vars::PID_FILE,
+    )]
+    pid_file: Option<PathBuf>,
 
     #[arg(long, value_name = "BASE_PATH", env = "AMARU_REWARDS_FILE")]
     pub rewards_file: Option<PathBuf>,
@@ -98,24 +132,19 @@ pub struct Args {
     pub snapshot_file: Option<PathBuf>,
 }
 
-pub async fn run(
-    args: Args,
-    meter_provider: Option<SdkMeterProvider>,
-) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run(args: Args, meter_provider: Option<SdkMeterProvider>) -> Result<(), Box<dyn std::error::Error>> {
     with_optional_pid_file(args.pid_file.clone(), async |_pid_file| {
         let config = parse_args(args)?;
         pre_flight_checks()?;
 
-        let metrics = meter_provider
-            .clone()
-            .map(track_system_metrics)
-            .transpose()?;
-
-        let peers = config.upstream_peers.iter().map(|p| Peer::new(p)).collect();
+        let metrics = meter_provider.clone().map(track_system_metrics).transpose()?;
 
         let exit = amaru::exit::hook_exit_token();
 
-        bootstrap(config, peers, exit, meter_provider).await?;
+        let running = build_and_run_node(config, meter_provider)?;
+
+        exit.cancelled().await;
+        running.abort();
 
         if let Some(handle) = metrics {
             handle.abort();
@@ -128,16 +157,23 @@ pub async fn run(
 
 fn parse_args(args: Args) -> Result<Config, Box<dyn std::error::Error>> {
     let network = args.network;
-    let ledger_dir = args
-        .ledger_dir
-        .unwrap_or_else(|| default_ledger_dir(network).into());
-    let chain_dir = args
-        .chain_dir
-        .unwrap_or_else(|| default_chain_dir(network).into());
 
-    info!(peer_address=%args.peer_address.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "),
-        ledger_dir=%ledger_dir.to_string_lossy(), chain_dir=%chain_dir.to_string_lossy(), network=%args.network, listen_address=args.listen_address, max_downstream_peers = args.max_downstream_peers, max_extra_ledger_snapshots = %args.max_extra_ledger_snapshots, migrate_chain_db = args.migrate_chain_db, pid_file=%args.pid_file.unwrap_or_default().to_string_lossy(),
-        "Running command run",
+    let ledger_dir = args.ledger_dir.unwrap_or_else(|| default_ledger_dir(network).into());
+
+    let chain_dir = args.chain_dir.unwrap_or_else(|| default_chain_dir(network).into());
+
+    info!(
+        _command = "run",
+        chain_dir = %chain_dir.to_string_lossy(),
+        ledger_dir = %ledger_dir.to_string_lossy(),
+        listen_address = args.listen_address,
+        max_downstream_peers = args.max_downstream_peers,
+        max_extra_ledger_snapshots = %args.max_extra_ledger_snapshots,
+        migrate_chain_db = args.migrate_chain_db,
+        network = %args.network,
+        peer_address = %args.peer_address.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "),
+        pid_file = %args.pid_file.unwrap_or_default().to_string_lossy(),
+        "running"
     );
 
     Ok(Config {
@@ -150,6 +186,7 @@ fn parse_args(args: Args) -> Result<Config, Box<dyn std::error::Error>> {
         max_downstream_peers: args.max_downstream_peers,
         max_extra_ledger_snapshots: args.max_extra_ledger_snapshots,
         migrate_chain_db: args.migrate_chain_db,
+        ..Config::default()
     })
 }
 
@@ -177,10 +214,7 @@ fn pre_flight_checks() -> Result<(), PreFlightError> {
                     %EXPECTED_MIN_FOR_SOFT_FD_LIMIT,
                     "Increase the limit for open files before starting Amaru (see ulimit -n).",
                 );
-                Err(PreFlightError::NotEnoughFileDescriptors(
-                    EXPECTED_MIN_FOR_SOFT_FD_LIMIT,
-                    current_soft_fd_limit,
-                ))
+                Err(PreFlightError::NotEnoughFileDescriptors(EXPECTED_MIN_FOR_SOFT_FD_LIMIT, current_soft_fd_limit))
             } else {
                 Ok(())
             }

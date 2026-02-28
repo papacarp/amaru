@@ -12,20 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use amaru::observability;
-use amaru::observability::{
-    DEFAULT_OTLP_METRIC_URL, DEFAULT_OTLP_SERVICE_NAME, DEFAULT_OTLP_SPAN_URL,
-};
-
-use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
-use observability::OpenTelemetryConfig;
-use panic::panic_handler;
 use std::sync::LazyLock;
+
+use amaru::{
+    observability::{Color, setup_observability},
+    panic::panic_handler,
+};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use tracing::info;
 
 mod cmd;
-mod metrics;
-mod panic;
 mod pid;
 
 mod built_info {
@@ -47,24 +43,19 @@ static VERSION: LazyLock<String> = LazyLock::new(|| {
 enum Command {
     /// Bootstrap the node with needed data.
     ///
-    /// This command simplifies the process of bootstrapping an Amaru
-    /// node for a given network.
+    /// This command simplifies the process of bootstrapping an Amaru node for any given well-known network:
     ///
-    /// In its current form, given a network name, a target directory
-    /// and possibly a peer to connect to, it will lookup for
-    /// bootstrap configuration files in `data/${network name}/`
-    /// directory to download snapshots, import those snapshots into
-    /// the ledger, import nonces, and import headers.
+    ///   - mainnet
+    ///   - preprod
+    ///   - preview
+    ///
+    /// It is a combination of the following fine-grained steps:
+    ///
+    ///   - import-ledger-state
+    ///   - import-headers
+    ///   - import-nonces
+    #[clap(verbatim_doc_comment)]
     Bootstrap(cmd::bootstrap::Args),
-
-    FetchChainHeaders(cmd::fetch_chain_headers::Args),
-
-    /// Run the node in all its glory.
-    Run(cmd::run::Args),
-
-    /// Import the ledger state from a CBOR export produced by a Haskell node.
-    #[clap(alias = "import")]
-    ImportLedgerState(cmd::import_ledger_state::Args),
 
     /// Convert ledger state as produced by Haskell node into data suitable
     /// for amaru.
@@ -79,14 +70,8 @@ enum Command {
     /// * The`Nonces` from the `HeaderState` which are written to a `nonces.json` file.
     ConvertLedgerState(cmd::convert_ledger_state::Args),
 
-    /// Import block headers from `${config_dir}/${network name}/`
-    #[clap(alias = "import-chain-db")]
-    ImportHeaders(cmd::import_headers::Args),
-
-    /// Import VRF nonces intermediate states
-    ImportNonces(cmd::import_nonces::Args),
-
     /// Dump the content of the chain database for troubleshooting purposes.
+    ///
     /// This command dumps the _whole_ content of the chain database in a human-readable format:
     ///  - Headers (hash + hex-encoded body)
     ///  - Parent-child relationships between headers
@@ -96,22 +81,47 @@ enum Command {
     ///
     DumpChainDB(cmd::dump_chain_db::Args),
 
-    /// Migrate the Chain Database to the current version.
+    /// Dump all registered trace schemas as JSON Schema.
+    ///
+    /// This command outputs all registered trace schemas in JSON Schema format.
+    /// Useful for documentation, tooling, and validation.
+    #[command(name = "dump-traces-schema")]
+    DumpTracesSchema(cmd::dump_schemas::Args),
+
+    /// Fetch specified headers
+    FetchChainHeaders(cmd::fetch_chain_headers::Args),
+
+    /// Import block headers
+    #[clap(alias = "import-chain-db")]
+    ImportHeaders(cmd::import_headers::Args),
+
+    /// Import the ledger state from a CBOR export produced by a Haskell node.
+    #[clap(alias = "import")]
+    ImportLedgerState(cmd::import_ledger_state::Args),
+
+    /// Import VRF nonces intermediate states
+    ImportNonces(cmd::import_nonces::Args),
+
+    /// Migrate the chain database to the current version.
+    ///
     /// This command is only relevant when one upgrades Amaru to a newer version that
     /// requires changes in the database format.
     MigrateChainDB(cmd::migrate_chain_db::Args),
 
+    /// Reset the ledger database to the beginning of a specific epoch
+    ResetToEpoch(cmd::reset_to_epoch::Args),
+
+    /// Run the node in all its glory.
+    #[command(alias = "daemon")]
+    Run(cmd::run::Args),
+
     /// Calculate and display current stake distribution by pool ID.
-    /// This reads from the ledger database and can be run independently of the running node.
     StakeSummary(cmd::stake_summary::Args),
 
     /// Output detailed live stake data including delegator lists for each pool.
-    /// This reads from the ledger database and can be run independently of the running node.
-    /// Outputs JSON format suitable for pickling in the legacy format.
     LiveStakeDetailed(cmd::live_stake_detailed::Args),
 
     /// Display the current epoch and slot from the chain tip.
-    /// This reads from the chain database and can be run independently of the running node.
     Tip(cmd::tip::Args),
 }
 
@@ -129,72 +139,52 @@ struct Cli {
     #[clap(long, action, env("AMARU_WITH_JSON_TRACES"))]
     with_json_traces: bool,
 
-    #[arg(long, value_name = "STRING", env("AMARU_OTLP_SERVICE_NAME"), default_value_t = DEFAULT_OTLP_SERVICE_NAME.to_string()
-    )]
-    otlp_service_name: String,
-
-    #[arg(long, value_name = "URL", env("AMARU_OTLP_SPAN_URL"), default_value_t = DEFAULT_OTLP_SPAN_URL.to_string()
-    )]
-    otlp_span_url: String,
-
-    #[arg(long, value_name = "URL", env("AMARU_OTLP_METRIC_URL"), default_value_t = DEFAULT_OTLP_METRIC_URL.to_string()
-    )]
-    otlp_metric_url: String,
+    #[clap(long, action, env("AMARU_COLOR"))]
+    color: Option<Color>,
 }
 
-#[tokio::main]
+// TODO(rkuhn): properly measure and design the Tokio runtime setup we need.
+// (probably one runtime for network with 1-2 threads, one for CPU-bound tasks according to parallelism,
+// one for running the consensus pipeline incl. Store access with 2+ threads)
+#[expect(clippy::unwrap_used)]
+#[tokio::main(worker_threads = 4)]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     panic_handler();
 
-    let matches = <Cli as CommandFactory>::command()
-        .version(VERSION.as_str())
-        .get_matches();
+    let matches = <Cli as CommandFactory>::command().version(VERSION.as_str()).get_matches();
     let args = <Cli as FromArgMatches>::from_arg_matches(&matches)?;
 
-    let mut subscriber = observability::TracingSubscriber::new();
+    // Skip observability setup for dump-traces-schema to avoid polluting stderr
+    let skip_logging = matches!(args.command, Command::DumpTracesSchema(_));
 
-    let (observability::OpenTelemetryHandle { metrics, teardown }, warning_otlp) =
-        if args.with_open_telemetry {
-            observability::setup_open_telemetry(
-                &OpenTelemetryConfig {
-                    service_name: args.otlp_service_name.clone(),
-                    span_url: args.otlp_span_url.clone(),
-                    metric_url: args.otlp_metric_url.clone(),
-                },
-                &mut subscriber,
-            )
-        } else {
-            (observability::OpenTelemetryHandle::default(), None)
-        };
-
-    let warning_json = if args.with_json_traces {
-        observability::setup_json_traces(&mut subscriber)
-    } else {
-        None
+    let (rewards_file, snapshot_file) = match &args.command {
+        Command::Run(a) => (a.rewards_file.clone(), a.snapshot_file.clone()),
+        _ => (None, None),
     };
 
-    // NOTE: Both warnings are bound to the same ENV var, so `.or` prevents from logging it twice.
-    if let Some(notify) = warning_otlp.or(warning_json) {
-        notify();
+    let (metrics, teardown) = if skip_logging {
+        (None, Box::new(|| Ok(())) as Box<dyn FnOnce() -> Result<(), Box<dyn std::error::Error>>>)
+    } else {
+        let (m, t) = setup_observability(
+            args.with_open_telemetry,
+            args.with_json_traces,
+            Color::is_enabled(args.color),
+            rewards_file,
+            snapshot_file,
+        );
+        (Some(m), t)
+    };
+
+    if !skip_logging {
+        info!(
+            with_open_telemetry = args.with_open_telemetry,
+            with_json_traces = args.with_json_traces,
+            "Started with global arguments"
+        );
     }
 
-    info!(
-        with_open_telemetry = args.with_open_telemetry,
-        with_json_traces = args.with_json_traces,
-        otlp_service_name = args.otlp_service_name,
-        otlp_span_url = args.otlp_span_url,
-        otlp_metric_url = args.otlp_metric_url,
-        "Started with global arguments"
-    );
-
     let result = match args.command {
-        Command::Run(run_args) => {
-            subscriber.init_with_file_loggers(
-                run_args.rewards_file.clone(),
-                run_args.snapshot_file.clone(),
-            );
-            cmd::run::run(run_args, metrics).await
-        },
+        Command::Run(run_args) => cmd::run::run(run_args, metrics.unwrap()).await,
         Command::ImportLedgerState(args) => cmd::import_ledger_state::run(args).await,
         Command::ImportHeaders(args) => cmd::import_headers::run(args).await,
         Command::ImportNonces(args) => cmd::import_nonces::run(args).await,
@@ -202,7 +192,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::FetchChainHeaders(args) => cmd::fetch_chain_headers::run(args).await,
         Command::ConvertLedgerState(args) => cmd::convert_ledger_state::run(args).await,
         Command::DumpChainDB(args) => cmd::dump_chain_db::run(args).await,
+        Command::DumpTracesSchema(args) => cmd::dump_schemas::run(args).await,
         Command::MigrateChainDB(args) => cmd::migrate_chain_db::run(args).await,
+        Command::ResetToEpoch(args) => cmd::reset_to_epoch::run(args).await,
         Command::StakeSummary(args) => {
             cmd::stake_summary::run(args).map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())) as Box<dyn std::error::Error>)
         },

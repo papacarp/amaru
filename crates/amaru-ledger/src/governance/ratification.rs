@@ -12,22 +12,24 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{
-    governance::ratification::proposals_forest::ProposalsForestCompass,
-    state::StakeDistributionView,
-    store::{StoreError, TransactionalContext, columns::proposals},
-    summary::{SafeRatio, stake_distribution::StakeDistribution},
-};
-use amaru_kernel::{
-    Ballot, ComparableProposalId, ConstitutionalCommitteeStatus, DRep, Epoch, EraHistory, Lovelace,
-    PoolId, StakeCredential, UnitInterval, Vote, Voter, protocol_parameters::ProtocolParameters,
-};
-use num::Zero;
 use std::{
     collections::{BTreeMap, BTreeSet},
     rc::Rc,
 };
-use tracing::{Level, Span, debug_span, field, info, info_span, instrument, trace_span};
+
+use amaru_kernel::{
+    Ballot, ComparableProposalId, ConstitutionalCommitteeStatus, DRep, Epoch, EraHistory, Lovelace, PoolId,
+    ProtocolParameters, RationalNumber, StakeCredential, Vote, Voter,
+};
+use amaru_observability::trace;
+use num::Zero;
+use tracing::{Span, field, info};
+
+use crate::{
+    state::StakeDistributionView,
+    store::{StoreError, TransactionalContext, columns::proposals},
+    summary::{SafeRatio, stake_distribution::StakeDistribution},
+};
 
 mod constitutional_committee;
 pub use constitutional_committee::ConstitutionalCommittee;
@@ -37,13 +39,13 @@ mod dreps;
 mod stake_pools;
 
 mod proposal_enum;
-use proposal_enum::{CommitteeUpdate, OrphanProposal, ProposalEnum};
+pub use proposal_enum::*;
 
 mod proposals_forest;
-use proposals_forest::{ProposalsEnactError, ProposalsForest, ProposalsInsertError};
+pub use proposals_forest::*;
 
 mod proposals_roots;
-pub use proposals_roots::{ProposalsRoots, ProposalsRootsRc};
+pub use proposals_roots::*;
 
 mod proposals_tree;
 
@@ -66,7 +68,7 @@ pub struct RatificationContext<'distr> {
     pub constitutional_committee: Option<ConstitutionalCommittee>,
 
     /// All latest votes indexed by proposals and voters.
-    pub votes: BTreeMap<ComparableProposalId, BTreeMap<Voter, Ballot>>,
+    pub votes: BTreeMap<ComparableProposalId, Vec<(Voter, Ballot)>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -84,19 +86,14 @@ pub struct RatificationResult<'distr, S> {
     pub pruned_proposals: BTreeSet<Rc<ComparableProposalId>>,
 }
 
-pub type StoreUpdate<'distr, S> =
-    Box<dyn FnOnce(&S, &RatificationContext<'distr>) -> Result<(), StoreError>>;
+pub type StoreUpdate<'distr, S> = Box<dyn FnOnce(&S, &RatificationContext<'distr>) -> Result<(), StoreError>>;
 
 impl<'distr> RatificationContext<'distr> {
-    #[instrument(
-        level = Level::INFO,
-        skip_all,
-        fields(
-            roots.protocol_parameters = opt_root(roots.protocol_parameters.as_deref()),
-            roots.hard_fork = opt_root(roots.hard_fork.as_deref()),
-            roots.constitutional_committee = opt_root(roots.constitutional_committee.as_deref()),
-            roots.constitution = opt_root(roots.constitution.as_deref()),
-        ),
+    #[trace(INFO, amaru::ledger::governance::RATIFY_PROPOSALS,
+        roots_protocol_parameters = opt_root(roots.protocol_parameters.as_deref()),
+        roots_hard_fork = opt_root(roots.hard_fork.as_deref()),
+        roots_constitutional_committee = opt_root(roots.constitutional_committee.as_deref()),
+        roots_constitution = opt_root(roots.constitution.as_deref())
     )]
     pub fn ratify_proposals<'store, S: TransactionalContext<'store>>(
         mut self,
@@ -108,8 +105,7 @@ impl<'distr> RatificationContext<'distr> {
         // in what order and what are the relationships between proposals; such that, when a
         // proposal is enacted, conflicting proposals (those pointing at the same parent) are
         // pruned.
-        let mut forest = ProposalsForest::new(self.epoch, &roots, self.treasury)
-            .drain(era_history, proposals)?;
+        let mut forest = ProposalsForest::new(self.epoch, &roots, self.treasury).drain(era_history, proposals)?;
 
         // A mutable compass to navigate the forest. This compass holds the tiny bit of mutable
         // state we need to iterate over the forest; but without introducing a mutable borrow on
@@ -132,8 +128,7 @@ impl<'distr> RatificationContext<'distr> {
             // The inner block limits the lifetime of the immutable borrow(s) on forest; so that we
             // can then borrow the forest as immutable when a proposal gets ratified.
             let ratified: Option<(Rc<ComparableProposalId>, ProposalEnum)> = {
-                let Some((id, (proposal, _))) = compass.next(&forest, &self.protocol_parameters)
-                else {
+                let Some((id, (proposal, _))) = compass.next(&forest, &self.protocol_parameters) else {
                     break;
                 };
 
@@ -178,11 +173,7 @@ impl<'distr> RatificationContext<'distr> {
         let new_roots = forest.roots();
         store_updates.push(Box::new(move |db, _ctx| db.set_proposals_roots(&new_roots)));
 
-        Ok(RatificationResult {
-            context: self,
-            store_updates,
-            pruned_proposals,
-        })
+        Ok(RatificationResult { context: self, store_updates, pruned_proposals })
     }
 
     /// Apply the effect of a (now-approved) proposal to both the current state (i.e. self), and
@@ -198,192 +189,131 @@ impl<'distr> RatificationContext<'distr> {
         pruned_proposals: &mut BTreeSet<Rc<ComparableProposalId>>,
         store_updates: &mut Vec<StoreUpdate<'distr, S>>,
     ) -> Result<(), RatificationInternalError> {
-        Self::new_enact_span(&id, &proposal).in_scope(
-            || -> Result<(), RatificationInternalError> {
-                let mut now_obsolete = forest.enact(id, &proposal, compass)?;
+        Self::new_enact_span(&id, &proposal).in_scope(|| -> Result<(), RatificationInternalError> {
+            let mut now_obsolete = forest.enact(id, &proposal, compass)?;
 
-                tracing::Span::current().record(
-                    "proposals.pruned",
-                    now_obsolete
-                        .iter()
-                        .map(|id| id.to_compact_string())
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                );
+            tracing::Span::current().record(
+                "proposals.pruned",
+                now_obsolete.iter().map(|id| id.to_compact_string()).collect::<Vec<_>>().join(", "),
+            );
 
-                pruned_proposals.append(&mut now_obsolete);
+            pruned_proposals.append(&mut now_obsolete);
 
-                match proposal {
-                    ProposalEnum::ProtocolParameters(params_update, _parent) => {
-                        self.protocol_parameters.update(params_update);
-                        store_updates.push(Box::new(|db, ctx| {
-                            db.set_protocol_parameters(&ctx.protocol_parameters)
-                        }));
-                    }
-
-                    ProposalEnum::HardFork(protocol_version, _parent) => {
-                        self.protocol_parameters.protocol_version = protocol_version;
-                        store_updates.push(Box::new(|db, ctx| {
-                            db.set_protocol_parameters(&ctx.protocol_parameters)
-                        }));
-                    }
-
-                    ProposalEnum::ConstitutionalCommittee(
-                        CommitteeUpdate::NoConfidence,
-                        _parent,
-                    ) => {
-                        self.constitutional_committee = None;
-                        store_updates.push(Box::new(|db, _ctx| {
-                            db.update_constitutional_committee(
-                                &ConstitutionalCommitteeStatus::NoConfidence,
-                                BTreeMap::new(),
-                                BTreeSet::new(),
-                            )?;
-
-                            db.with_cc_members(|iterator| {
-                                // NOTE: CC members are not deleted when entering no confidence
-                                // mode. They are simply marked as inactive.
-                                //
-                                // In particular, their hot<->cold bindings are preserved.
-                                for (_, mut row) in iterator {
-                                    if let Some(cc_member) = row.borrow_mut() {
-                                        cc_member.valid_until = None;
-                                    }
-                                }
-                            })?;
-
-                            Ok(())
-                        }))
-                    }
-
-                    ProposalEnum::ConstitutionalCommittee(
-                        CommitteeUpdate::ChangeMembers {
-                            removed,
-                            added,
-                            threshold,
-                        },
-                        _parent,
-                    ) => {
-                        let committee_status = ConstitutionalCommitteeStatus::Trusted {
-                            threshold: UnitInterval {
-                                numerator: threshold.numer().try_into().unwrap_or_else(|e| {
-                                    unreachable!("threshold numerator larger than u64?!: {e}")
-                                }),
-                                denominator: threshold.denom().try_into().unwrap_or_else(|e| {
-                                    unreachable!("threshold numerator larger than u64?!: {e}")
-                                }),
-                            },
-                        };
-
-                        let added_as_inactive = added
-                            .iter()
-                            .map(|(cold_cred, valid_until)| {
-                                (cold_cred.clone(), (None, *valid_until))
-                            })
-                            .collect();
-
-                        if let Some(committee) = &mut self.constitutional_committee {
-                            committee.update(
-                                threshold,
-                                added_as_inactive,
-                                removed.iter().collect(),
-                            );
-                        } else {
-                            self.constitutional_committee =
-                                Some(ConstitutionalCommittee::new(threshold, added_as_inactive));
-                        }
-
-                        store_updates.push(Box::new(move |db, _ctx| {
-                            db.update_constitutional_committee(&committee_status, added, removed)
-                        }))
-                    }
-
-                    ProposalEnum::Constitution(constitution, _parent) => store_updates
-                        .push(Box::new(move |db, _ctx| db.set_constitution(&constitution))),
-
-                    ProposalEnum::Orphan(OrphanProposal::TreasuryWithdrawal(withdrawals)) => {
-                        store_updates.push(Box::new(move |db, _ctx| {
-                            let leftovers = withdrawals
-                                .into_iter()
-                                .try_fold::<_, _, Result<_, StoreError>>(
-                                    0,
-                                    |leftovers, (account, magic_internet_money)| {
-                                        Ok(leftovers + db.refund(&account, magic_internet_money)?)
-                                    },
-                                )?;
-
-                            if leftovers > 0 {
-                                info!(%leftovers, "withdrawn into treasury");
-                                db.with_pots(|mut pots| pots.borrow_mut().treasury += leftovers)?;
-                            }
-
-                            Ok(())
-                        }));
-                    }
-
-                    ProposalEnum::Orphan(OrphanProposal::NicePoll) => {
-                        unreachable!("enacted an un-enactable proposal kind ?!")
-                    }
+            match proposal {
+                ProposalEnum::ProtocolParameters(params_update, _parent) => {
+                    self.protocol_parameters.update(params_update);
+                    store_updates.push(Box::new(|db, ctx| db.set_protocol_parameters(&ctx.protocol_parameters)));
                 }
 
-                Ok(())
-            },
-        )
+                ProposalEnum::HardFork(protocol_version, _parent) => {
+                    self.protocol_parameters.protocol_version = protocol_version;
+                    store_updates.push(Box::new(|db, ctx| db.set_protocol_parameters(&ctx.protocol_parameters)));
+                }
+
+                ProposalEnum::ConstitutionalCommittee(CommitteeUpdate::NoConfidence, _parent) => {
+                    self.constitutional_committee = None;
+                    store_updates.push(Box::new(|db, _ctx| {
+                        db.update_constitutional_committee(
+                            &ConstitutionalCommitteeStatus::NoConfidence,
+                            BTreeMap::new(),
+                            BTreeSet::new(),
+                        )?;
+
+                        db.with_cc_members(|iterator| {
+                            // NOTE: CC members are not deleted when entering no confidence
+                            // mode. They are simply marked as inactive.
+                            //
+                            // In particular, their hot<->cold bindings are preserved.
+                            for (_, mut row) in iterator {
+                                if let Some(cc_member) = row.borrow_mut() {
+                                    cc_member.valid_until = None;
+                                }
+                            }
+                        })?;
+
+                        Ok(())
+                    }))
+                }
+
+                ProposalEnum::ConstitutionalCommittee(
+                    CommitteeUpdate::ChangeMembers { removed, added, threshold },
+                    _parent,
+                ) => {
+                    let committee_status = ConstitutionalCommitteeStatus::Trusted {
+                        threshold: RationalNumber {
+                            numerator: threshold
+                                .numer()
+                                .try_into()
+                                .unwrap_or_else(|e| unreachable!("threshold numerator larger than u64?!: {e}")),
+                            denominator: threshold
+                                .denom()
+                                .try_into()
+                                .unwrap_or_else(|e| unreachable!("threshold numerator larger than u64?!: {e}")),
+                        },
+                    };
+
+                    let added_as_inactive = added
+                        .iter()
+                        .map(|(cold_cred, valid_until)| (cold_cred.clone(), (None, *valid_until)))
+                        .collect();
+
+                    if let Some(committee) = &mut self.constitutional_committee {
+                        committee.update(threshold, added_as_inactive, removed.iter().collect());
+                    } else {
+                        self.constitutional_committee =
+                            Some(ConstitutionalCommittee::new(threshold, added_as_inactive));
+                    }
+
+                    store_updates.push(Box::new(move |db, _ctx| {
+                        db.update_constitutional_committee(&committee_status, added, removed)
+                    }))
+                }
+
+                ProposalEnum::Constitution(constitution, _parent) => {
+                    store_updates.push(Box::new(move |db, _ctx| db.set_constitution(&constitution)))
+                }
+
+                ProposalEnum::Orphan(OrphanProposal::TreasuryWithdrawal(withdrawals)) => {
+                    store_updates.push(Box::new(move |db, _ctx| {
+                        let leftovers = withdrawals.into_iter().try_fold::<_, _, Result<_, StoreError>>(
+                            0,
+                            |leftovers, (account, magic_internet_money)| {
+                                Ok(leftovers + db.refund(&account, magic_internet_money)?)
+                            },
+                        )?;
+
+                        if leftovers > 0 {
+                            info!(%leftovers, "withdrawn into treasury");
+                            db.with_pots(|mut pots| pots.borrow_mut().treasury += leftovers)?;
+                        }
+
+                        Ok(())
+                    }));
+                }
+
+                ProposalEnum::Orphan(OrphanProposal::NicePoll) => {
+                    unreachable!("enacted an un-enactable proposal kind ?!")
+                }
+            }
+
+            Ok(())
+        })
     }
 
     fn new_enact_span(id: &ComparableProposalId, proposal: &ProposalEnum) -> Span {
-        info_span!(
+        tracing::info_span!(
             "enacting",
             "proposal.id" = id.to_compact_string(),
             "proposal.kind" = proposal.display_kind(),
-            "proposals.pruned" = field::Empty,
         )
     }
 
     fn new_ratify_span(id: &ComparableProposalId, proposal: &ProposalEnum) -> Span {
-        if matches!(proposal, ProposalEnum::Orphan(OrphanProposal::NicePoll)) {
-            trace_span!(
-                "ratifying",
-                "proposal.id" = id.to_compact_string(),
-                "proposal.kind" = proposal.display_kind(),
-                "required_threshold.committee" = field::Empty,
-                "votes.committee.yes" = field::Empty,
-                "votes.committee.no" = field::Empty,
-                "votes.committee.abstain" = field::Empty,
-                "approved.committee" = field::Empty,
-                "required_threshold.pools" = field::Empty,
-                "votes.pools.yes" = field::Empty,
-                "votes.pools.no" = field::Empty,
-                "votes.pools.abstain" = field::Empty,
-                "approved.pools" = field::Empty,
-                "required_threshold.dreps" = field::Empty,
-                "votes.dreps.yes" = field::Empty,
-                "votes.dreps.no" = field::Empty,
-                "votes.dreps.abstain" = field::Empty,
-                "approved.dreps" = field::Empty,
-            )
-        } else {
-            debug_span!(
-                "ratifying",
-                "proposal.id" = id.to_compact_string(),
-                "proposal.kind" = proposal.display_kind(),
-                "required_threshold.committee" = field::Empty,
-                "votes.committee.yes" = field::Empty,
-                "votes.committee.no" = field::Empty,
-                "votes.committee.abstain" = field::Empty,
-                "approved.committee" = field::Empty,
-                "required_threshold.pools" = field::Empty,
-                "votes.pools.yes" = field::Empty,
-                "votes.pools.no" = field::Empty,
-                "votes.pools.abstain" = field::Empty,
-                "approved.pools" = field::Empty,
-                "required_threshold.dreps" = field::Empty,
-                "votes.dreps.yes" = field::Empty,
-                "votes.dreps.no" = field::Empty,
-                "votes.dreps.abstain" = field::Empty,
-                "approved.dreps" = field::Empty,
-            )
-        }
+        tracing::trace_span!(
+            "ratifying",
+            "proposal.id" = id.to_compact_string(),
+            "proposal.kind" = proposal.display_kind(),
+        )
     }
 
     fn is_accepted_by_everyone(
@@ -394,9 +324,8 @@ impl<'distr> RatificationContext<'distr> {
     ) -> bool {
         let span = tracing::Span::current();
 
-        let empty = BTreeMap::new();
         let (dreps_votes, cc_votes, pool_votes) =
-            partition_votes(self.votes.get(id).unwrap_or(&empty));
+            partition_votes(self.votes.get(id).map(|v| v.as_slice()).unwrap_or(&[]));
 
         // NOTE: because ratification is an expensive operation, and something that we *may* have
         // to replay due to rollbacks, it's important to do the least amount of work possible.
@@ -410,17 +339,13 @@ impl<'distr> RatificationContext<'distr> {
         span.record("approved.committee", cc_approved);
 
         if cc_approved {
-            let spos_approved =
-                self.is_accepted_by_stake_pool_operators(proposal, pool_votes, stake_distribution);
+            let spos_approved = self.is_accepted_by_stake_pool_operators(proposal, pool_votes, stake_distribution);
 
             span.record("approved.pools", spos_approved);
 
             if spos_approved {
-                let dreps_approved = self.is_accepted_by_delegate_representatives(
-                    proposal,
-                    dreps_votes,
-                    stake_distribution,
-                );
+                let dreps_approved =
+                    self.is_accepted_by_delegate_representatives(proposal, dreps_votes, stake_distribution);
 
                 span.record("approved.dreps", dreps_approved);
 
@@ -446,8 +371,7 @@ impl<'distr> RatificationContext<'distr> {
                     proposal,
                 )?;
 
-                tracing::Span::current()
-                    .record("required_threshold.committee", field::display(&threshold));
+                tracing::Span::current().record("required_threshold.committee", field::display(&threshold));
 
                 let tally = || committee.tally(self.epoch, votes);
 
@@ -469,16 +393,10 @@ impl<'distr> RatificationContext<'distr> {
         ) {
             None => false,
             Some(threshold) => {
-                tracing::Span::current()
-                    .record("required_threshold.pools", field::display(&threshold));
+                tracing::Span::current().record("required_threshold.pools", field::display(&threshold));
 
                 let tally = || {
-                    stake_pools::tally(
-                        self.protocol_parameters.protocol_version,
-                        proposal,
-                        votes,
-                        stake_distribution,
-                    )
+                    stake_pools::tally(self.protocol_parameters.protocol_version, proposal, votes, stake_distribution)
                 };
 
                 threshold == SafeRatio::zero() || tally() >= threshold
@@ -500,12 +418,9 @@ impl<'distr> RatificationContext<'distr> {
         ) {
             None => false,
             Some(threshold) => {
-                tracing::Span::current()
-                    .record("required_threshold.dreps", field::display(&threshold));
+                tracing::Span::current().record("required_threshold.dreps", field::display(&threshold));
 
-                let tally = || -> SafeRatio {
-                    dreps::tally(self.epoch, proposal, votes, stake_distribution)
-                };
+                let tally = || -> SafeRatio { dreps::tally(self.epoch, proposal, votes, stake_distribution) };
 
                 threshold == SafeRatio::zero() || tally() >= threshold
             }
@@ -519,30 +434,26 @@ impl<'distr> RatificationContext<'distr> {
 /// Split all the ballots into sub-maps that are specific to each voter types; so that we ease the
 /// processing of each category down the line.
 fn partition_votes(
-    votes: &BTreeMap<Voter, Ballot>,
-) -> (
-    BTreeMap<DRep, &Vote>,
-    BTreeMap<StakeCredential, &Vote>,
-    BTreeMap<&PoolId, &Vote>,
-) {
+    votes: &[(Voter, Ballot)],
+) -> (BTreeMap<DRep, &Vote>, BTreeMap<StakeCredential, &Vote>, BTreeMap<&PoolId, &Vote>) {
     votes.iter().fold(
         (BTreeMap::new(), BTreeMap::new(), BTreeMap::new()),
         |(mut dreps, mut committee, mut pools), (voter, ballot)| {
             match voter {
                 Voter::ConstitutionalCommitteeKey(hash) => {
-                    committee.insert(StakeCredential::AddrKeyhash(*hash), &ballot.vote);
+                    committee.insert(StakeCredential::AddrKeyhash(*hash), ballot.vote());
                 }
                 Voter::ConstitutionalCommitteeScript(hash) => {
-                    committee.insert(StakeCredential::ScriptHash(*hash), &ballot.vote);
+                    committee.insert(StakeCredential::ScriptHash(*hash), ballot.vote());
                 }
                 Voter::DRepKey(hash) => {
-                    dreps.insert(DRep::Key(*hash), &ballot.vote);
+                    dreps.insert(DRep::Key(*hash), ballot.vote());
                 }
                 Voter::DRepScript(hash) => {
-                    dreps.insert(DRep::Script(*hash), &ballot.vote);
+                    dreps.insert(DRep::Script(*hash), ballot.vote());
                 }
                 Voter::StakePoolKey(pool_id) => {
-                    pools.insert(pool_id, &ballot.vote);
+                    pools.insert(pool_id, ballot.vote());
                 }
             };
 
@@ -552,20 +463,20 @@ fn partition_votes(
 }
 
 fn opt_root(opt: Option<&ComparableProposalId>) -> String {
-    opt.map(|r| r.to_compact_string())
-        .unwrap_or_else(|| "none".to_string())
+    opt.map(|r| r.to_compact_string()).unwrap_or_else(|| "none".to_string())
 }
 
 // Tests
 // ----------------------------------------------------------------------------
 
 #[cfg(any(all(test, not(target_os = "windows")), feature = "test-utils"))]
-pub mod tests {
-    use amaru_kernel::{Bound, Epoch, EraHistory, EraParams, Slot, Summary};
-    use amaru_slot_arithmetic::TimeMs;
-    use std::sync::LazyLock;
+pub use tests::*;
 
-    pub use super::proposal_enum::tests::*;
+#[cfg(any(all(test, not(target_os = "windows")), feature = "test-utils"))]
+mod tests {
+    use std::{sync::LazyLock, time::Duration};
+
+    use amaru_kernel::{Epoch, EraBound, EraHistory, EraName, EraParams, EraSummary, Slot};
 
     // Technically higher than the actual gap we may see in 'real life', but, why not.
     pub const MAX_ARBITRARY_EPOCH: u64 = 10;
@@ -573,18 +484,15 @@ pub mod tests {
 
     pub static ERA_HISTORY: LazyLock<EraHistory> = LazyLock::new(|| {
         EraHistory::new(
-            &[Summary {
-                start: Bound {
-                    time_ms: TimeMs::from(0),
-                    slot: Slot::from(0),
-                    epoch: Epoch::from(0),
-                },
+            &[EraSummary {
+                start: EraBound { time: Duration::from_secs(0), slot: Slot::from(0), epoch: Epoch::from(0) },
                 end: None,
                 params: EraParams {
                     // Pick an epoch length such that epochs falls within the min and max bounds;
                     // knowing that slots ranges across all u64.
                     epoch_size_slots: u64::MAX / (MAX_ARBITRARY_EPOCH - MIN_ARBITRARY_EPOCH + 1),
-                    slot_length: 1,
+                    slot_length: Duration::from_secs(1),
+                    era_name: EraName::Conway,
                 },
             }],
             Slot::from(0),
@@ -593,9 +501,10 @@ pub mod tests {
 
     #[cfg(all(test, not(target_os = "windows")))]
     mod internal {
-        use super::*;
-        use amaru_kernel::tests::any_proposal_pointer;
+        use amaru_kernel::any_proposal_pointer;
         use proptest::{prelude::*, test_runner::RngSeed};
+
+        use super::*;
 
         proptest! {
             #[test]

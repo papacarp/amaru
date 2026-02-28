@@ -12,15 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{borrow::Cow, collections::BTreeMap};
+use std::{borrow::Cow, collections::BTreeMap, ops::Deref};
 
-use amaru_kernel::{Address, AssetName, Hash, TransactionInput};
+use amaru_kernel::{
+    Address, AssetName, Certificate as PallasCertificate, Hash, StakePayload, TransactionInput, size::DATUM,
+};
 
 use crate::{
     IsKnownPlutusVersion, PlutusDataError, PlutusVersion, ToPlutusData, constr, constr_v1,
     script_context::{
-        Certificate, CurrencySymbol, DatumOption, Datums, IsPrePlutusVersion3, Mint, OutputRef,
-        PlutusData, ScriptContext, ScriptPurpose, TransactionOutput, TxInfo, Value, Withdrawals,
+        Certificate, CurrencySymbol, DatumOption, Datums, IsPrePlutusVersion3, Mint, OutputRef, PlutusData,
+        ScriptContext, ScriptPurpose, StakeAddress, TransactionOutput, TxInfo, Value, Withdrawals,
     },
 };
 
@@ -90,14 +92,10 @@ where
             }
             ScriptPurpose::Certifying(_ix, certificate) => constr_v1!(3, [certificate]),
 
-            ScriptPurpose::Voting(_) => Err(PlutusDataError::unsupported_version(
-                "voting purpose unsupported",
-                V,
-            )),
-            ScriptPurpose::Proposing(_, _) => Err(PlutusDataError::unsupported_version(
-                "proposing purpose unsupported",
-                V,
-            )),
+            ScriptPurpose::Voting(_) => Err(PlutusDataError::unsupported_version("voting purpose unsupported", V)),
+            ScriptPurpose::Proposing(_, _) => {
+                Err(PlutusDataError::unsupported_version("proposing purpose unsupported", V))
+            }
         }
     }
 }
@@ -116,13 +114,29 @@ where
         } else {
             let mut map = self.0.clone();
 
-            map.insert(
-                CurrencySymbol::Lovelace,
-                BTreeMap::from([(Cow::Owned(AssetName::from(vec![])), 0u64)]),
-            );
+            map.insert(CurrencySymbol::Lovelace, BTreeMap::from([(Cow::Owned(AssetName::from(vec![])), 0u64)]));
 
             map.to_plutus_data()
         }
+    }
+}
+
+impl ToPlutusData<1> for amaru_kernel::StakeAddress {
+    /// In PlutusV1 and PlutusV2:
+    /// Anywhere a `StakeCredential` is used, it is actually an enum with variants `Pointer` and `Credential`
+    ///
+    /// It is actually not possible (by the ledger serialization) logic to construct a StakeAddress with a `Pointer`, so this can be hardcoded
+    fn to_plutus_data(&self) -> Result<PlutusData, PlutusDataError> {
+        match self.payload() {
+            StakePayload::Stake(keyhash) => constr_v1!(0, [constr_v1!(0, [keyhash])?]),
+            StakePayload::Script(script_hash) => constr_v1!(0, [constr_v1!(1, [script_hash])?]),
+        }
+    }
+}
+
+impl ToPlutusData<1> for StakeAddress {
+    fn to_plutus_data(&self) -> Result<PlutusData, PlutusDataError> {
+        <amaru_kernel::StakeAddress as ToPlutusData<1>>::to_plutus_data(&self.0)
     }
 }
 
@@ -136,16 +150,18 @@ where
 }
 
 #[allow(clippy::wildcard_enum_match_arm)]
-impl<const V: u8> ToPlutusData<V> for Certificate
+impl<const V: u8> ToPlutusData<V> for Certificate<'_>
 where
     PlutusVersion<V>: IsKnownPlutusVersion + IsPrePlutusVersion3,
 {
     /// Serialize `Certificate` as PlutusData for PlutusV1 or PlutusV2.
     ///
+    /// It's worth noting that the following certificate variants are allowed, but translated to the "old" representation:
+    /// - `Certificate::Reg` -> `Certificate::StakeRegistration`
+    /// - `Certificate::UnReg` -> `Certificate::StakeDeregistration`
+    ///
     /// # Errors
     /// The following Certificates cannot be included in PlutusV1 or PlutusV2:
-    /// - `Certificate::Reg`
-    /// - `Certificate::UnReg`
     /// - `Certificate::VoteDeleg`
     /// - `Certificate::StakeVoteDeleg`
     /// - `Certificate::StakeRegDeleg`
@@ -158,18 +174,29 @@ where
     /// - `Certificate::UpdateDRepCert`
     ///
     /// Serializing any of those will result in a `PlutusDataError`
+    ///
+    /// In PlutusV1 and PlutusV2:
+    /// Anywhere a `StakeCredential` is used, it is actually an enum with variants `Pointer` and `Credential`
+    ///
+    /// It is actually not possible (by the ledger serialization) logic to construct a Certificate with a `Pointer`, so this can be hardcoded to `Constr(0, [cred])`
     fn to_plutus_data(&self) -> Result<PlutusData, PlutusDataError> {
-        match self {
-            Certificate::StakeRegistration(stake_credential) => {
-                constr!(0, [stake_credential])
+        match self.deref() {
+            PallasCertificate::StakeRegistration(stake_credential) => {
+                constr!(0, [constr!(0, [stake_credential])?])
             }
-            Certificate::StakeDeregistration(stake_credential) => {
-                constr!(1, [stake_credential])
+            PallasCertificate::Reg(stake_credential, _) => {
+                constr!(0, [constr!(0, [stake_credential])?])
             }
-            Certificate::StakeDelegation(stake_credential, hash) => {
-                constr!(2, [stake_credential, hash])
+            PallasCertificate::StakeDeregistration(stake_credential) => {
+                constr!(1, [constr!(0, [stake_credential])?])
             }
-            Certificate::PoolRegistration {
+            PallasCertificate::UnReg(stake_credential, _) => {
+                constr!(1, [constr!(0, [stake_credential])?])
+            }
+            PallasCertificate::StakeDelegation(stake_credential, hash) => {
+                constr!(2, [constr!(0, [stake_credential])?, hash])
+            }
+            PallasCertificate::PoolRegistration {
                 operator,
                 vrf_keyhash,
                 pledge: _,
@@ -180,11 +207,10 @@ where
                 relays: _,
                 pool_metadata: _,
             } => constr!(3, [operator, vrf_keyhash]),
-            Certificate::PoolRetirement(hash, epoch) => constr!(4, [hash, epoch]),
-            certificate => Err(PlutusDataError::unsupported_version(
-                format!("illegal certificate type: {certificate:?}"),
-                V,
-            )),
+            PallasCertificate::PoolRetirement(hash, epoch) => constr!(4, [hash, epoch]),
+            certificate => {
+                Err(PlutusDataError::unsupported_version(format!("illegal certificate type: {certificate:?}"), V))
+            }
         }
     }
 }
@@ -199,7 +225,7 @@ impl ToPlutusData<1> for TransactionOutput<'_> {
                 self.value,
                 match self.datum {
                     DatumOption::Hash(hash) => Some(*hash),
-                    _ => None::<Hash<32>>,
+                    _ => None::<Hash<DATUM>>,
                 },
             ]
         )
@@ -215,11 +241,8 @@ where
     /// Notably, in PlutusV1 and PlutusV2, `Mint` must include a
     /// zero value lovelace asset
     fn to_plutus_data(&self) -> Result<PlutusData, PlutusDataError> {
-        let mut mint = self
-            .0
-            .iter()
-            .map(|(policy, multiasset)| (policy.to_vec(), multiasset))
-            .collect::<BTreeMap<_, _>>();
+        let mut mint =
+            self.0.iter().map(|(policy, multiasset)| (policy.to_vec(), multiasset)).collect::<BTreeMap<_, _>>();
 
         let ada_bundle = BTreeMap::from([(Cow::Owned(vec![].into()), 0)]);
         mint.insert(vec![], &ada_bundle);
@@ -227,15 +250,10 @@ where
         <BTreeMap<_, _> as ToPlutusData<1>>::to_plutus_data(&mint)
     }
 }
+
 impl ToPlutusData<1> for Withdrawals {
     fn to_plutus_data(&self) -> Result<PlutusData, PlutusDataError> {
-        <Vec<_> as ToPlutusData<1>>::to_plutus_data(
-            &self
-                .0
-                .iter()
-                .map(|(address, coin)| Ok((constr_v1!(0, [address])?, *coin)))
-                .collect::<Result<Vec<_>, _>>()?,
-        )
+        <Vec<_> as ToPlutusData<1>>::to_plutus_data(&self.0.iter().collect::<Vec<_>>())
     }
 }
 
@@ -250,11 +268,14 @@ impl ToPlutusData<1> for Datums<'_> {
 mod tests {
     use std::ops::Deref;
 
-    use super::super::test_vectors::{self, TestVector};
-    use super::*;
-    use amaru_kernel::network::NetworkName;
-    use amaru_kernel::{MintedTx, OriginalHash, normalize_redeemers, to_cbor};
+    use amaru_kernel::{NetworkName, PROTOCOL_VERSION_10, Transaction, cbor, to_cbor};
     use test_case::test_case;
+
+    use super::{
+        super::test_vectors::{self, TestVector},
+        *,
+    };
+    use crate::script_context::Redeemers;
 
     const PLUTUS_VERSION: u8 = 1;
 
@@ -274,34 +295,26 @@ mod tests {
         // this should probably be encoded in the TestVector itself
         let network = NetworkName::Preprod;
 
-        let transaction: MintedTx<'_> =
-            minicbor::decode(&test_vector.input.transaction_bytes).unwrap();
+        let transaction: Transaction = cbor::decode(&test_vector.input.transaction_bytes).unwrap();
 
-        let redeemers = normalize_redeemers(
-            transaction
-                .transaction_witness_set
-                .redeemer
-                .as_ref()
-                .expect("no redeemers provided")
-                .deref(),
-        );
+        let redeemers = Redeemers::iter_from(transaction.witnesses.redeemer.as_ref().expect("no redeemers provided"));
 
         let produced_contexts = redeemers
-            .iter()
             .map(|redeemer| {
                 let utxos = test_vector.input.utxo.clone().into();
                 let tx_info = TxInfo::new(
-                    &transaction.transaction_body,
-                    &transaction.transaction_witness_set,
-                    &transaction.transaction_body.original_hash(),
+                    &transaction.body,
+                    &transaction.witnesses,
+                    transaction.body.id(),
                     &utxos,
                     &0.into(),
                     network,
                     network.into(),
+                    PROTOCOL_VERSION_10,
                 )
                 .unwrap();
 
-                let script_context = ScriptContext::new(&tx_info, redeemer, None).unwrap();
+                let script_context = ScriptContext::new(&tx_info, redeemer.deref()).unwrap();
                 let plutus_data = to_cbor(
                     &<ScriptContext<'_> as ToPlutusData<1>>::to_plutus_data(&script_context)
                         .expect("failed to ScriptContext convert to PlutusData"),
@@ -311,9 +324,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let found_match = produced_contexts
-            .iter()
-            .any(|context| context == &test_vector.expectations.script_context);
+        let found_match = produced_contexts.iter().any(|context| context == &test_vector.expectations.script_context);
 
         assert!(
             found_match,

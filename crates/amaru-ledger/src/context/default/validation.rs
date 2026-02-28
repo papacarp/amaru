@@ -12,34 +12,37 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    mem,
+};
+
+use amaru_kernel::{
+    Anchor, Ballot, BallotId, CertificatePointer, ComparableProposalId, DRep, DRepRegistration, Epoch, Hash, Lovelace,
+    MemoizedPlutusData, MemoizedScript, MemoizedTransactionOutput, PoolId, PoolParams, Proposal, ProposalId,
+    ProposalPointer, RequiredScript, StakeCredential, TransactionInput, Vote, Voter,
+    size::{DATUM, KEY, SCRIPT},
+};
+use tracing::trace;
+
 use crate::{
     context::{
-        AccountState, AccountsSlice, CCMember, CommitteeSlice, DRepsSlice, DelegateError,
-        PoolsSlice, PotsSlice, ProposalsSlice, RegisterError, UnregisterError, UpdateError,
-        UtxoSlice, ValidationContext, WitnessSlice, blanket_known_datums, blanket_known_scripts,
+        AccountState, AccountsSlice, CCMember, CommitteeSlice, DRepsSlice, DelegateError, PoolsSlice, PotsSlice,
+        ProposalsSlice, RegisterError, UnregisterError, UpdateError, UtxoSlice, ValidationContext, WitnessSlice,
+        blanket_known_datums, blanket_known_scripts,
     },
     state::volatile_db::VolatileState,
 };
-use amaru_kernel::{
-    Anchor, Ballot, BallotId, CertificatePointer, ComparableProposalId, DRep, DRepRegistration,
-    DatumHash, Hash, Lovelace, MemoizedPlutusData, MemoizedScript, MemoizedTransactionOutput,
-    PoolId, PoolParams, Proposal, ProposalId, ProposalPointer, RequiredScript, ScriptHash,
-    StakeCredential, TransactionInput, Vote, Voter,
-};
-use amaru_slot_arithmetic::Epoch;
-use core::mem;
-use std::collections::{BTreeMap, BTreeSet};
-use tracing::trace;
 
 #[derive(Debug)]
 pub struct DefaultValidationContext {
     utxo: BTreeMap<TransactionInput, MemoizedTransactionOutput>,
     state: VolatileState,
-    known_scripts: BTreeMap<ScriptHash, TransactionInput>,
-    known_datums: BTreeMap<DatumHash, TransactionInput>,
-    required_signers: BTreeSet<Hash<28>>,
+    known_scripts: BTreeMap<Hash<SCRIPT>, TransactionInput>,
+    known_datums: BTreeMap<Hash<DATUM>, TransactionInput>,
+    required_signers: BTreeSet<Hash<KEY>>,
     required_scripts: BTreeSet<RequiredScript>,
-    required_supplemental_datums: BTreeSet<Hash<32>>,
+    required_supplemental_datums: BTreeSet<Hash<DATUM>>,
     required_bootstrap_roots: BTreeSet<Hash<28>>,
 }
 
@@ -95,12 +98,12 @@ impl PoolsSlice for DefaultValidationContext {
     }
 
     fn register(&mut self, params: PoolParams, pointer: CertificatePointer) {
-        trace!(?params, "certificate.pool.registration");
+        trace!(target: amaru_observability::CERTIFICATE_TARGET, pool_id = %params.id, "certificate.pool.registration");
         self.state.pools.register(params.id, (params, pointer))
     }
 
     fn retire(&mut self, pool: PoolId, epoch: Epoch) {
-        trace!(%pool, %epoch, "certificate.pool.retirement");
+        trace!(target: amaru_observability::CERTIFICATE_TARGET, pool_id = %pool, epoch = %epoch, "certificate.pool.retirement");
         self.state.pools.unregister(pool, epoch)
     }
 }
@@ -115,10 +118,8 @@ impl AccountsSlice for DefaultValidationContext {
         credential: StakeCredential,
         state: AccountState,
     ) -> Result<(), RegisterError<AccountState, StakeCredential>> {
-        trace!(?credential, "certificate.stake.registration"); // TODO: Use Display for Credential
-        self.state
-            .accounts
-            .register(credential, state.deposit, state.pool, state.drep)?;
+        trace!(target: amaru_observability::CERTIFICATE_TARGET, ?credential, "certificate.stake.registration");
+        self.state.accounts.register(credential, state.deposit, state.pool, state.drep)?;
         Ok(())
     }
 
@@ -128,10 +129,8 @@ impl AccountsSlice for DefaultValidationContext {
         pool: PoolId,
         pointer: CertificatePointer,
     ) -> Result<(), DelegateError<StakeCredential, PoolId>> {
-        trace!(?credential, %pool, "certificate.stake.delegation"); // TODO: Use Display for Credential
-        self.state
-            .accounts
-            .bind_left(credential, Some((pool, pointer)))?;
+        trace!(target: amaru_observability::CERTIFICATE_TARGET, ?credential, %pool, "certificate.stake.delegation");
+        self.state.accounts.bind_left(credential, Some((pool, pointer)))?;
         Ok(())
     }
 
@@ -141,15 +140,13 @@ impl AccountsSlice for DefaultValidationContext {
         drep: DRep,
         pointer: CertificatePointer,
     ) -> Result<(), DelegateError<StakeCredential, DRep>> {
-        trace!(?credential, ?drep, "certificate.vote.delegation");
-        self.state
-            .accounts
-            .bind_right(credential, Some((drep, pointer)))?;
+        trace!(target: amaru_observability::CERTIFICATE_TARGET, ?credential, ?drep, "certificate.vote.delegation");
+        self.state.accounts.bind_right(credential, Some((drep, pointer)))?;
         Ok(())
     }
 
     fn unregister(&mut self, credential: StakeCredential) {
-        trace!(?credential, "certificate.stake.deregistration");
+        trace!(target: amaru_observability::CERTIFICATE_TARGET, ?credential, "certificate.stake.deregistration");
         self.state.accounts.unregister(credential)
     }
 
@@ -169,28 +166,20 @@ impl DRepsSlice for DefaultValidationContext {
         registration: DRepRegistration,
         anchor: Option<Anchor>,
     ) -> Result<(), RegisterError<DRepRegistration, StakeCredential>> {
-        trace!(?drep, deposit = %registration.deposit, "certificate.drep.registration");
-        self.state
-            .dreps
-            .register(drep, registration, anchor, None)?;
+        trace!(target: amaru_observability::CERTIFICATE_TARGET, ?drep, deposit = %registration.deposit, "certificate.drep.registration");
+        self.state.dreps.register(drep, registration, anchor, None)?;
         Ok(())
     }
 
-    fn update(
-        &mut self,
-        drep: StakeCredential,
-        anchor: Option<Anchor>,
-    ) -> Result<(), UpdateError<StakeCredential>> {
-        trace!(?drep, ?anchor, "certificate.drep.update");
+    fn update(&mut self, drep: StakeCredential, anchor: Option<Anchor>) -> Result<(), UpdateError<StakeCredential>> {
+        trace!(target: amaru_observability::CERTIFICATE_TARGET, ?drep, ?anchor, "certificate.drep.update");
         self.state.dreps.bind_left(drep, anchor)?;
         Ok(())
     }
 
     fn unregister(&mut self, drep: StakeCredential, refund: Lovelace, pointer: CertificatePointer) {
-        trace!(?drep, ?refund, "certificate.drep.retirement");
-        self.state
-            .dreps_deregistrations
-            .insert(drep.clone(), pointer);
+        trace!(target: amaru_observability::CERTIFICATE_TARGET, ?drep, ?refund, "certificate.drep.retirement");
+        self.state.dreps_deregistrations.insert(drep.clone(), pointer);
         self.state.dreps.unregister(drep)
     }
 }
@@ -201,7 +190,7 @@ impl CommitteeSlice for DefaultValidationContext {
         cc_member: StakeCredential,
         delegate: StakeCredential,
     ) -> Result<(), DelegateError<StakeCredential, StakeCredential>> {
-        trace!(name: "certificate.committee.delegate", ?cc_member, ?delegate);
+        trace!(target: amaru_observability::CERTIFICATE_TARGET, ?cc_member, ?delegate, "certificate.committee.delegate");
         self.state.committee.bind_left(cc_member, Some(delegate))?;
         Ok(())
     }
@@ -211,7 +200,7 @@ impl CommitteeSlice for DefaultValidationContext {
         cc_member: StakeCredential,
         anchor: Option<Anchor>,
     ) -> Result<(), UnregisterError<CCMember, StakeCredential>> {
-        trace!(name: "certificate.committee.resign", ?cc_member, ?anchor);
+        trace!(target: amaru_observability::CERTIFICATE_TARGET, ?cc_member, ?anchor, "certificate.committee.resign");
         self.state.committee.unregister(cc_member);
         Ok(())
     }
@@ -219,25 +208,18 @@ impl CommitteeSlice for DefaultValidationContext {
 
 impl ProposalsSlice for DefaultValidationContext {
     fn acknowledge(&mut self, id: ProposalId, pointer: ProposalPointer, proposal: Proposal) {
-        self.state
-            .proposals
-            .register(id.into(), (proposal, pointer), None, None)
-            .unwrap_or_default(); // Can't happen as by construction key is unique
+        self.state.proposals.register(id.into(), (proposal, pointer), None, None).unwrap_or_default(); // Can't happen as by construction key is unique
     }
 
     fn vote(&mut self, proposal: ProposalId, voter: Voter, vote: Vote, anchor: Option<Anchor>) {
-        self.state.votes.produce(
-            BallotId {
-                proposal: ComparableProposalId::from(proposal),
-                voter,
-            },
-            Ballot { vote, anchor },
-        )
+        self.state
+            .votes
+            .produce(BallotId { proposal: ComparableProposalId::from(proposal), voter }, Ballot::new(vote, anchor))
     }
 }
 
 impl WitnessSlice for DefaultValidationContext {
-    fn require_vkey_witness(&mut self, vkey_hash: amaru_kernel::AddrKeyhash) {
+    fn require_vkey_witness(&mut self, vkey_hash: Hash<KEY>) {
         self.required_signers.insert(vkey_hash);
     }
 
@@ -245,11 +227,11 @@ impl WitnessSlice for DefaultValidationContext {
         self.required_scripts.insert(script);
     }
 
-    fn acknowledge_script(&mut self, script_hash: ScriptHash, location: TransactionInput) {
+    fn acknowledge_script(&mut self, script_hash: Hash<SCRIPT>, location: TransactionInput) {
         self.known_scripts.insert(script_hash, location);
     }
 
-    fn acknowledge_datum(&mut self, datum_hash: DatumHash, location: TransactionInput) {
+    fn acknowledge_datum(&mut self, datum_hash: Hash<DATUM>, location: TransactionInput) {
         self.known_datums.insert(datum_hash, location);
     }
 
@@ -257,11 +239,11 @@ impl WitnessSlice for DefaultValidationContext {
         self.required_bootstrap_roots.insert(root);
     }
 
-    fn allow_supplemental_datum(&mut self, datum_hash: Hash<32>) {
+    fn allow_supplemental_datum(&mut self, datum_hash: Hash<DATUM>) {
         self.required_supplemental_datums.insert(datum_hash);
     }
 
-    fn required_signers(&mut self) -> BTreeSet<Hash<28>> {
+    fn required_signers(&mut self) -> BTreeSet<Hash<KEY>> {
         mem::take(&mut self.required_signers)
     }
 
@@ -273,16 +255,16 @@ impl WitnessSlice for DefaultValidationContext {
         mem::take(&mut self.required_bootstrap_roots)
     }
 
-    fn allowed_supplemental_datums(&mut self) -> BTreeSet<Hash<32>> {
+    fn allowed_supplemental_datums(&mut self) -> BTreeSet<Hash<DATUM>> {
         mem::take(&mut self.required_supplemental_datums)
     }
 
-    fn known_scripts(&mut self) -> BTreeMap<ScriptHash, &MemoizedScript> {
+    fn known_scripts(&mut self) -> BTreeMap<Hash<SCRIPT>, &MemoizedScript> {
         let known_scripts = mem::take(&mut self.known_scripts);
         blanket_known_scripts(self, known_scripts.into_iter())
     }
 
-    fn known_datums(&mut self) -> BTreeMap<DatumHash, &MemoizedPlutusData> {
+    fn known_datums(&mut self) -> BTreeMap<Hash<DATUM>, &MemoizedPlutusData> {
         let known_datums = mem::take(&mut self.known_datums);
         blanket_known_datums(self, known_datums.into_iter())
     }

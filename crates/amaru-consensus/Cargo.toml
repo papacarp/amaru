@@ -19,11 +19,10 @@ test-utils = ["proptest", "dep:rand", "serde_json"]
 
 [dependencies]
 anyhow.workspace = true
-async-trait.workspace = true
 hex.workspace = true
 itertools.workspace = true
 opentelemetry.workspace = true
-pallas-crypto.workspace = true
+parking_lot.workspace = true
 proptest = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
 rayon.workspace = true
@@ -35,21 +34,25 @@ tracing.workspace = true
 tracing-opentelemetry.workspace = true
 
 amaru-kernel.workspace = true
-amaru-ouroboros.workspace = true
+amaru-mempool.workspace = true
 amaru-metrics.workspace = true
+amaru-observability.workspace = true
 amaru-ouroboros-traits.workspace = true
-amaru-slot-arithmetic.workspace = true
+amaru-ouroboros.workspace = true
+amaru-protocols.workspace = true
 pure-stage.workspace = true
 
 [dev-dependencies]
 hex.workspace = true
+pretty_assertions.workspace = true
 proptest.workspace = true
 rand.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["rt", "macros"] }
+tracing-subscriber.workspace = true
+
 amaru-kernel = { workspace = true, features = ["test-utils"] }
-amaru-slot-arithmetic = { workspace = true, features = ["test-utils"] }
 amaru-ouroboros-traits = { workspace = true, features = ["test-utils"] }
 amaru-stores.workspace = true
 

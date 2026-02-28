@@ -12,8 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use amaru_kernel::{EraHistory, Hasher, IsHeader, Nonce};
-use amaru_slot_arithmetic::{Epoch, EraHistoryError, Slot};
+use amaru_kernel::{Epoch, EraHistory, EraHistoryError, Hasher, IsHeader, Nonce};
 
 /// Obtain the final nonce at an epoch boundary for the epoch from the stable candidate and the
 /// last block (header) of the previous epoch.
@@ -21,9 +20,7 @@ use amaru_slot_arithmetic::{Epoch, EraHistoryError, Slot};
 /// Return `None` if header has no parent (i.e. which never happens because all our blocks have
 /// parents in Amaru).
 pub fn from_candidate<H: IsHeader>(header: &H, candidate: &Nonce) -> Option<Nonce> {
-    Some(Hasher::<256>::hash(
-        &[&candidate[..], &header.parent()?[..]].concat(),
-    ))
+    Some(Hasher::<256>::hash(&[&candidate[..], &header.parent()?[..]].concat()))
 }
 
 /// Evolve the current nonce by combining it with the current rolling nonce and the
@@ -34,11 +31,7 @@ pub fn from_candidate<H: IsHeader>(header: &H, candidate: &Nonce) -> Option<Nonc
 /// blake2b-256 hash.
 pub fn evolve<H: IsHeader>(header: &H, current: &Nonce) -> Nonce {
     Hasher::<256>::hash(
-        &[
-            &current[..],
-            &Hasher::<256>::hash(header.extended_vrf_nonce_output().as_slice())[..],
-        ]
-        .concat(),
+        &[&current[..], &Hasher::<256>::hash(header.extended_vrf_nonce_output().as_slice())[..]].concat(),
     )
 }
 
@@ -52,13 +45,12 @@ pub fn randomness_stability_window<H: IsHeader>(
     randomness_stabilization_window: u64,
 ) -> Result<(Epoch, bool), EraHistoryError> {
     let slot = header.slot();
-    let tip = Slot::from(slot);
+    let tip = slot;
     let epoch = era_history.slot_to_epoch(tip, tip)?;
 
     let next_epoch_first_slot = era_history.next_epoch_first_slot(epoch, &tip)?;
 
-    let is_within_stability_window =
-        slot + randomness_stabilization_window < u64::from(next_epoch_first_slot);
+    let is_within_stability_window = slot.as_u64() + randomness_stabilization_window < next_epoch_first_slot.as_u64();
 
     Ok((epoch, is_within_stability_window))
 }

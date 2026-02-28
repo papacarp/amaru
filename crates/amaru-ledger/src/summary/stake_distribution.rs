@@ -12,6 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::BTreeMap;
+
+use amaru_iter_borrow::borrowable_proxy::BorrowableProxy;
+use amaru_kernel::{
+    DRep, Epoch, HasLovelace, Lovelace, Network, PoolId, ProtocolParameters, StakeCredential, expect_stake_credential,
+};
+use serde::ser::SerializeStruct;
+use tracing::info;
+
 use crate::{
     store::{Snapshot, StoreError, columns::*},
     summary::{
@@ -21,17 +30,6 @@ use crate::{
         serde::{encode_drep, encode_pool_id, encode_stake_credential, serialize_map},
     },
 };
-use amaru_iter_borrow::borrowable_proxy::BorrowableProxy;
-use amaru_kernel::{
-    DRep, HasLovelace, Lovelace, Network, PoolId, StakeCredential, expect_stake_credential,
-    output_stake_credential, protocol_parameters::ProtocolParameters,
-};
-use amaru_slot_arithmetic::Epoch;
-use hex;
-use serde::ser::SerializeStruct;
-use serde_json;
-use std::collections::BTreeMap;
-use tracing::info;
 
 // Helper struct for serializing accounts with lovelace and delegation info
 #[derive(serde::Serialize)]
@@ -86,10 +84,7 @@ impl StakeDistribution {
     pub fn new(
         db: &impl Snapshot,
         protocol_parameters: &ProtocolParameters,
-        GovernanceSummary {
-            mut dreps,
-            deposits,
-        }: GovernanceSummary,
+        GovernanceSummary { mut dreps, deposits }: GovernanceSummary,
     ) -> Result<Self, StoreError> {
         let epoch = db.epoch();
 
@@ -129,10 +124,7 @@ impl StakeDistribution {
                         blocks_count: 0,
                         // pre-compute margin here (1 - m), which gets used for all
                         // member and leader rewards calculation.
-                        margin: safe_ratio(
-                            row.current_params.margin.numerator,
-                            row.current_params.margin.denominator,
-                        ),
+                        margin: safe_ratio(row.current_params.margin.numerator, row.current_params.margin.denominator),
                         parameters: row.current_params,
                     },
                 )
@@ -148,19 +140,12 @@ impl StakeDistribution {
                         lovelace: account.rewards,
                         pool: account.pool.and_then(|(pool, since)| {
                             let PoolState { registered_at, .. } = pools.get(&pool)?;
-                            if &since >= registered_at {
-                                Some(pool)
-                            } else {
-                                None
-                            }
+                            if &since >= registered_at { Some(pool) } else { None }
                         }),
                         drep: account.drep.and_then(|(drep, since)| match drep {
                             DRep::Abstain | DRep::NoConfidence => Some(drep),
                             DRep::Key { .. } | DRep::Script { .. } => {
-                                let DRepState {
-                                    previous_deregistration,
-                                    ..
-                                } = dreps.get(&drep)?;
+                                let DRepState { previous_deregistration, .. } = dreps.get(&drep)?;
 
                                 // NOTE(PROTOCOL_VERSION_9):
                                 //
@@ -180,11 +165,7 @@ impl StakeDistribution {
                                 //
                                 // So we fallback to checking that no de-registration happened
                                 // post-delegation.
-                                if &Some(since) > previous_deregistration {
-                                    Some(drep)
-                                } else {
-                                    None
-                                }
+                                if &Some(since) > previous_deregistration { Some(drep) } else { None }
                             }
                         }),
                     },
@@ -197,11 +178,9 @@ impl StakeDistribution {
         // output's address and *lovelace* value, so we can skip on deserializing the rest of the value, as
         // well as the datum and/or script references if any.
         db.iter_utxos()?.for_each(|(_, output)| {
-            if let Some(credential) = output_stake_credential(&output) {
+            if let Some(credential) = output.delegate() {
                 let value = output.lovelace();
-                accounts
-                    .entry(credential)
-                    .and_modify(|account| account.lovelace += value);
+                accounts.entry(credential).and_modify(|account| account.lovelace += value);
             }
         });
 
@@ -215,30 +194,28 @@ impl StakeDistribution {
                 let (drep_deposits, pool_deposits) = deposits
                     .get(credential)
                     .map(|proposals| {
-                        proposals
-                            .iter()
-                            .fold((0, 0), |(drep_deposits, pool_deposits), proposal| {
-                                (
-                                    drep_deposits + proposal.deposit,
-                                    // NOTE(POOL_VOTING_STAKE_DISTRIBUTION):
-                                    //
-                                    // The pool distribution used for computing voting power is
-                                    // determined BEFORE refunds or withdrawal are processed.
-                                    //
-                                    // So unlike the DRep voting stake, which already includes those,
-                                    // we mustn't include the deposit as part of the pool voting stake
-                                    // for the epoch that immediately follows the expiry.
-                                    //
-                                    // Note that the refund is eventually credited in the following
-                                    // epoch so the deposit is effectively missing from the pools'
-                                    // voting stake for an entire epoch.
-                                    if epoch <= proposal.valid_until {
-                                        pool_deposits + proposal.deposit
-                                    } else {
-                                        pool_deposits
-                                    },
-                                )
-                            })
+                        proposals.iter().fold((0, 0), |(drep_deposits, pool_deposits), proposal| {
+                            (
+                                drep_deposits + proposal.deposit,
+                                // NOTE(POOL_VOTING_STAKE_DISTRIBUTION):
+                                //
+                                // The pool distribution used for computing voting power is
+                                // determined BEFORE refunds or withdrawal are processed.
+                                //
+                                // So unlike the DRep voting stake, which already includes those,
+                                // we mustn't include the deposit as part of the pool voting stake
+                                // for the epoch that immediately follows the expiry.
+                                //
+                                // Note that the refund is eventually credited in the following
+                                // epoch so the deposit is effectively missing from the pools'
+                                // voting stake for an entire epoch.
+                                if epoch <= proposal.valid_until {
+                                    pool_deposits + proposal.deposit
+                                } else {
+                                    pool_deposits
+                                },
+                            )
+                        })
                     })
                     .unwrap_or((0, 0));
 
@@ -291,9 +268,7 @@ impl StakeDistribution {
 
         let block_issuers = db.iter_block_issuers()?;
         block_issuers.for_each(|(_, issuer)| {
-            pools
-                .entry(issuer.slot_leader)
-                .and_modify(|pool| pool.blocks_count += 1);
+            pools.entry(issuer.slot_leader).and_modify(|pool| pool.blocks_count += 1);
         });
 
         // Serialize accounts with lovelace and delegation info
@@ -332,15 +307,7 @@ impl StakeDistribution {
             "stake_distribution.snapshot",
         );
 
-        Ok(StakeDistribution {
-            epoch,
-            active_stake,
-            dreps_voting_stake,
-            pools_voting_stake,
-            accounts,
-            pools,
-            dreps,
-        })
+        Ok(StakeDistribution { epoch, active_stake, dreps_voting_stake, pools_voting_stake, accounts, pools, dreps })
     }
 
     pub fn for_network(&self, network: Network) -> StakeDistributionForNetwork<'_> {
@@ -359,9 +326,7 @@ impl serde::Serialize for StakeDistributionForNetwork<'_> {
         s.serialize_field("epoch", &self.0.epoch)?;
         s.serialize_field("active_stake", &self.0.active_stake)?;
         s.serialize_field("voting_stake", &self.0.dreps_voting_stake)?;
-        serialize_map("accounts", &mut s, &self.0.accounts, |credential| {
-            encode_stake_credential(self.1, credential)
-        })?;
+        serialize_map("accounts", &mut s, &self.0.accounts, |credential| encode_stake_credential(self.1, credential))?;
         serialize_map("pools", &mut s, &self.0.pools, encode_pool_id)?;
         serialize_map("dreps", &mut s, &self.0.dreps, encode_drep)?;
         s.end()
@@ -370,17 +335,16 @@ impl serde::Serialize for StakeDistributionForNetwork<'_> {
 
 #[cfg(any(test, feature = "test-utils"))]
 pub mod tests {
-    use super::StakeDistribution;
-    use crate::summary::{AccountState, PoolState, safe_ratio, stake_distribution::DRepState};
+    use std::collections::BTreeMap;
+
     use amaru_kernel::{
-        Epoch, Lovelace, expect_stake_credential,
-        tests::{
-            any_anchor, any_certificate_pointer, any_drep, any_pool_id, any_pool_params,
-            any_stake_credential,
-        },
+        Epoch, Lovelace, any_anchor, any_certificate_pointer, any_drep, any_hash28, any_pool_params,
+        any_stake_credential, expect_stake_credential,
     };
     use proptest::{collection, option, prelude::*, prop_compose};
-    use std::collections::BTreeMap;
+
+    use super::StakeDistribution;
+    use crate::summary::{AccountState, PoolState, safe_ratio, stake_distribution::DRepState};
 
     prop_compose! {
         pub fn any_stake_distribution_no_pools(
@@ -415,7 +379,7 @@ pub mod tests {
     prop_compose! {
         pub fn any_stake_distribution_no_dreps()(
             epoch in any::<u64>(),
-            pools in collection::btree_map(any_pool_id(), any_pool_state(), 1..10),
+            pools in collection::btree_map(any_hash28(), any_pool_state(), 1..10),
             accounts in collection::btree_map(any_stake_credential(), any_account_state(), 1..20),
         ) -> StakeDistribution {
             let active_stake = pools.values().fold(0, |total, st| total + st.stake);
@@ -460,7 +424,7 @@ pub mod tests {
     prop_compose! {
         pub fn any_account_state()(
             lovelace in any::<Lovelace>(),
-            pool in option::of(any_pool_id()),
+            pool in option::of(any_hash28()),
             drep in option::of(any_drep()),
         ) -> AccountState {
             AccountState {

@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// EDR-010 - Ledger Validation Context
+// <https://github.com/pragma-org/amaru/blob/main/engineering-decision-records/010-ledger-validation-context.md>
 #![feature(try_trait_v2)]
 
 pub mod block_validator;
@@ -25,26 +27,19 @@ pub mod summary;
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use amaru_kernel::{
-        Bytes, Hash, MemoizedTransactionOutput, PostAlonzoTransactionOutput, TransactionInput,
-        TransactionOutput, Value, from_cbor, to_cbor,
-    };
+    use amaru_kernel::{Address, Hash, MemoizedTransactionOutput, TransactionInput, Value};
 
     pub(crate) fn fake_input(transaction_id: &str, index: u64) -> TransactionInput {
-        TransactionInput {
-            transaction_id: Hash::from(hex::decode(transaction_id).unwrap().as_slice()),
-            index,
-        }
+        TransactionInput { transaction_id: Hash::from(hex::decode(transaction_id).unwrap().as_slice()), index }
     }
 
     pub(crate) fn fake_output(address: &str) -> MemoizedTransactionOutput {
-        let output = TransactionOutput::PostAlonzo(PostAlonzoTransactionOutput {
-            address: Bytes::from(hex::decode(address).expect("Invalid hex address")),
+        MemoizedTransactionOutput {
+            is_legacy: false,
+            address: Address::from_hex(address).expect("Invalid hex address"),
             value: Value::Coin(0),
-            datum_option: None,
-            script_ref: None,
-        });
-
-        from_cbor(&to_cbor(&output)).unwrap()
+            datum: amaru_kernel::MemoizedDatum::None,
+            script: None,
+        }
     }
 }

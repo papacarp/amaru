@@ -12,6 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+
+use amaru_kernel::{
+    Anchor, Ballot, BallotId, CertificatePointer, ComparableProposalId, DRep, DRepRegistration, Epoch, Lovelace,
+    MemoizedTransactionOutput, Point, PoolId, PoolParams, Proposal, ProposalPointer, ProtocolParameters,
+    StakeCredential, TransactionInput,
+};
+
 use super::{
     diff_bind::{Bind, DiffBind, Empty},
     diff_epoch_reg::DiffEpochReg,
@@ -21,14 +29,6 @@ use crate::{
     state::{diff_bind::Resettable, diff_epoch_reg::Registrations},
     store::{self, columns::*},
 };
-use amaru_kernel::{
-    Anchor, Ballot, BallotId, CertificatePointer, ComparableProposalId, DRep, DRepRegistration,
-    Lovelace, MemoizedTransactionOutput, Point, PoolId, PoolParams, Proposal, ProposalPointer,
-    StakeCredential, TransactionInput, protocol_parameters::ProtocolParameters,
-};
-use amaru_slot_arithmetic::Epoch;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use tracing::error;
 
 pub const EVENT_TARGET: &str = "amaru::ledger::state::volatile_db";
 
@@ -91,30 +91,53 @@ impl VolatileDB {
         self.sequence.push_back(state);
     }
 
-    pub fn rollback_to<E>(
-        &mut self,
-        point: &Point,
-        on_unknown_point: impl Fn(&Point) -> E,
-    ) -> Result<(), E> {
+    pub fn rollback_to<E>(&mut self, point: &Point, on_unknown_point: impl Fn(&Point) -> E) -> Result<(), E> {
+        let target_slot = point.slot_or_default();
+
+        // Check if the target point is beyond the sequence
+        // In this case we simply return Ok since it this would not change the volatile state.
+        if let Some(last) = self.sequence.back()
+            && last.anchor.0.slot_or_default() < target_slot
+        {
+            tracing::warn!(
+                %target_slot,
+                last_slot = ?last.anchor.0.slot_or_default(),
+                "Attempting to rollback to a point beyond the last known volatile state"
+            );
+            return Ok(());
+        }
+
+        // Check if the target point is before the sequence
+        // In this case we return an error since it means rolling back the stable DB
+        if let Some(first) = self.sequence.front()
+            && target_slot < first.anchor.0.slot_or_default()
+        {
+            tracing::error!(
+                %target_slot,
+                first_slot = ?first.anchor.0.slot_or_default(),
+                "Attempting to rollback to a point before the first point of the volatile state"
+            );
+            return Err(on_unknown_point(point));
+        }
+
+        // Now we know the target point is within the sequence
+        // Rebuild the cache up to that point
         self.cache = VolatileCache::default();
 
+        // Keep all elements with slot <= target_slot
         let mut ix = 0;
         for diff in self.sequence.iter() {
-            if diff.anchor.0.slot_or_default() <= point.slot_or_default() {
+            if diff.anchor.0.slot_or_default() <= target_slot {
                 // TODO: See NOTE on VolatileDB regarding the .clone()
                 self.cache.merge(diff.state.utxo.clone());
                 ix += 1;
+            } else {
+                break;
             }
         }
 
-        if ix >= self.sequence.len() {
-            Err(on_unknown_point(point))
-        } else {
-            self.sequence.resize_with(ix, || {
-                unreachable!("ix is necessarly strictly smaller than the length")
-            });
-            Ok(())
-        }
+        self.sequence.resize_with(ix, || unreachable!("ix cannot exceed sequence length due to the loop break"));
+        Ok(())
     }
 }
 
@@ -142,12 +165,7 @@ impl VolatileCache {
 pub struct VolatileState {
     pub utxo: DiffSet<TransactionInput, MemoizedTransactionOutput>,
     pub pools: DiffEpochReg<PoolId, (PoolParams, CertificatePointer)>,
-    pub accounts: DiffBind<
-        StakeCredential,
-        (PoolId, CertificatePointer),
-        (DRep, CertificatePointer),
-        Lovelace,
-    >,
+    pub accounts: DiffBind<StakeCredential, (PoolId, CertificatePointer), (DRep, CertificatePointer), Lovelace>,
     pub dreps: DiffBind<StakeCredential, Anchor, Empty, DRepRegistration>,
     pub dreps_deregistrations: BTreeMap<StakeCredential, CertificatePointer>,
     pub committee: DiffBind<StakeCredential, StakeCredential, Empty, Empty>,
@@ -164,10 +182,7 @@ pub struct AnchoredVolatileState {
 
 impl VolatileState {
     pub fn anchor(self, point: &Point, issuer: PoolId) -> AnchoredVolatileState {
-        AnchoredVolatileState {
-            anchor: (point.clone(), issuer),
-            state: self,
-        }
+        AnchoredVolatileState { anchor: (*point, issuer), state: self }
     }
 
     pub fn resolve_input(&self, input: &TransactionInput) -> Option<&MemoizedTransactionOutput> {
@@ -227,20 +242,14 @@ impl AnchoredVolatileState {
                 accounts: add_accounts(self.state.accounts.registered.into_iter()),
                 dreps: add_dreps(self.state.dreps.registered.into_iter()),
                 cc_members: add_committee(self.state.committee.registered.into_iter()),
-                proposals: add_proposals(
-                    self.state.proposals.registered.into_iter(),
-                    epoch + gov_action_lifetime,
-                ),
+                proposals: add_proposals(self.state.proposals.registered.into_iter(), epoch + gov_action_lifetime),
                 votes: self.state.votes.produced.into_iter(),
             },
             remove: store::Columns {
                 utxo: self.state.utxo.consumed.into_iter(),
                 pools: self.state.pools.unregistered.into_iter(),
                 accounts: self.state.accounts.unregistered.into_iter(),
-                dreps: remove_dreps(
-                    self.state.dreps.unregistered.into_iter(),
-                    self.state.dreps_deregistrations,
-                ),
+                dreps: remove_dreps(self.state.dreps.unregistered.into_iter(), self.state.dreps_deregistrations),
                 cc_members: self.state.committee.unregistered.into_iter(),
                 proposals: {
                     debug_assert!(self.state.proposals.unregistered.is_empty());
@@ -283,22 +292,11 @@ fn add_pools(
 
 fn add_accounts(
     iterator: impl Iterator<
-        Item = (
-            StakeCredential,
-            Bind<(PoolId, CertificatePointer), (DRep, CertificatePointer), Lovelace>,
-        ),
+        Item = (StakeCredential, Bind<(PoolId, CertificatePointer), (DRep, CertificatePointer), Lovelace>),
     >,
 ) -> impl Iterator<Item = (accounts::Key, accounts::Value)> {
-    iterator.map(
-        |(
-            credential,
-            Bind {
-                left: pool,
-                right: drep,
-                value: deposit,
-            },
-        )| { (credential, (pool, drep, deposit, 0)) },
-    )
+    iterator
+        .map(|(credential, Bind { left: pool, right: drep, value: deposit })| (credential, (pool, drep, deposit, 0)))
 }
 
 // -------------------------------------------------------------------- DReps
@@ -307,16 +305,9 @@ fn add_accounts(
 fn add_dreps(
     iterator: impl Iterator<Item = (StakeCredential, Bind<Anchor, Empty, DRepRegistration>)>,
 ) -> impl Iterator<Item = (dreps::Key, dreps::Value)> {
-    iterator.map(
-        move |(
-            credential,
-            Bind {
-                left: anchor,
-                right: _,
-                value: registration,
-            },
-        ): (_, Bind<_, Empty, _>)| { (credential, (anchor, registration)) },
-    )
+    iterator.map(move |(credential, Bind { left: anchor, right: _, value: registration }): (_, Bind<_, Empty, _>)| {
+        (credential, (anchor, registration))
+    })
 }
 
 fn remove_dreps(
@@ -325,9 +316,8 @@ fn remove_dreps(
 ) -> impl Iterator<Item = (dreps::Key, CertificatePointer)> {
     iterator.map(move |credential| {
         #[expect(clippy::expect_used)]
-        let pointer = deregistrations
-            .remove(&credential)
-            .expect("every 'unregistered' drep must have a matching deregistration");
+        let pointer =
+            deregistrations.remove(&credential).expect("every 'unregistered' drep must have a matching deregistration");
 
         (credential, pointer)
     })
@@ -339,60 +329,134 @@ fn remove_dreps(
 fn add_committee(
     iterator: impl Iterator<Item = (StakeCredential, Bind<StakeCredential, Empty, Empty>)>,
 ) -> impl Iterator<Item = (cc_members::Key, cc_members::Value)> {
-    iterator.map(
-        |(
-            credential,
-            Bind {
-                left: hot_credential,
-                right: _,
-                value: _,
-            },
-        )| { (credential, (hot_credential, Resettable::Unchanged)) },
-    )
+    iterator.map(|(credential, Bind { left: hot_credential, right: _, value: _ })| {
+        (credential, (hot_credential, Resettable::Unchanged))
+    })
 }
 
 // ---------------------------------------------------------------- Proposals
 // --------------------------------------------------------------------------
 
 fn add_proposals(
-    iterator: impl Iterator<
-        Item = (
-            ComparableProposalId,
-            Bind<Empty, Empty, (Proposal, ProposalPointer)>,
-        ),
-    >,
+    iterator: impl Iterator<Item = (ComparableProposalId, Bind<Empty, Empty, (Proposal, ProposalPointer)>)>,
     expiration: Epoch,
 ) -> impl Iterator<Item = (proposals::Key, proposals::Value)> {
     iterator.enumerate().filter_map(
-        move |(
-            index,
-            (
-                proposal_id,
-                Bind {
-                    left: _,
-                    right: _,
-                    value,
-                },
-            ),
-        ): (usize, (_, Bind<_, Empty, _>))| {
-            match value {
-                Some((proposal, proposed_in)) => Some((
-                    proposal_id,
-                    proposals::Value {
-                        proposed_in,
-                        valid_until: expiration,
-                        proposal,
-                    },
-                )),
-                None => {
-                    error!(
-                        target: EVENT_TARGET,
-                        index,
-                        "add.proposals.no_proposal",
-                    );
-                    None
-                }
+        move |(index, (proposal_id, Bind { left: _, right: _, value })): (usize, (_, Bind<_, Empty, _>))| match value {
+            Some((proposal, proposed_in)) => {
+                Some((proposal_id, proposals::Value { proposed_in, valid_until: expiration, proposal }))
+            }
+            None => {
+                tracing::error!(
+                    target: EVENT_TARGET,
+                    index,
+                    "add.proposals.no_proposal",
+                );
+                None
             }
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use amaru_kernel::{Hash, Point, Slot};
+
+    use super::*;
+
+    #[test]
+    fn test_rollback_to_point_before_sequence_fails() {
+        // Create a VolatileDB with three states at slots 10, 20, 30
+        let mut db = create_volatile_db();
+
+        // Rollback to slot 5 (before the first element at slot 10)
+        // This represents rolling back to a point in the stable DB
+        let rollback_point = Point::Specific(Slot::from(5), Hash::new([0u8; 32]));
+
+        let result = db.rollback_to(&rollback_point, |_| "Point not found");
+
+        // This should fail
+        // (rolling back to a point inside the stable DB is not allowed)
+        assert!(result.is_err());
+        assert_eq!(db.len(), 3, "All elements should be retained");
+    }
+
+    #[test]
+    fn test_rollback_to_exact_last_element_should_succeed() {
+        // Create a VolatileDB with three states at slots 10, 20, 30
+        let mut db = create_volatile_db();
+
+        // Rollback to slot 30 (the last element)
+        let rollback_point = Point::Specific(Slot::from(30), Hash::new([0u8; 32]));
+
+        // This should succeed, keeping all 3 elements
+        let result = db.rollback_to(&rollback_point, |_| "Point not found");
+
+        assert!(result.is_ok(), "Rolling back to the exact slot of the last element should succeed");
+        assert_eq!(db.len(), 3, "All elements should be retained");
+    }
+
+    #[test]
+    fn test_rollback_to_middle_element_succeeds() {
+        // Create a VolatileDB with three states at slots 10, 20, 30
+        let mut db = create_volatile_db();
+
+        // Rollback to slot 20 (middle element)
+        let rollback_point = Point::Specific(Slot::from(20), Hash::new([0u8; 32]));
+
+        let result = db.rollback_to(&rollback_point, |_| "Point not found");
+
+        // This should succeed
+        assert!(result.is_ok());
+        assert_eq!(db.len(), 2, "Should keep elements at slots 10 and 20");
+    }
+
+    #[test]
+    fn test_rollback_to_point_after_sequence_succeeds() {
+        // Create a VolatileDB with three states at slots 10, 20, 30
+        let mut db = create_volatile_db();
+
+        // Try to rollback to slot 40 (after the sequence)
+        let rollback_point = Point::Specific(Slot::from(40), Hash::new([0u8; 32]));
+
+        let result = db.rollback_to(&rollback_point, |_| "Point not found");
+
+        // This should succeed
+        assert!(result.is_ok(), "Rolling back to a point after the sequence should succeed");
+        assert_eq!(db.len(), 3, "All elements should be retained");
+    }
+
+    #[test]
+    fn test_rollback_to_slot_between_elements_succeeds() {
+        // Create a VolatileDB with three states at slots 10, 20, 30
+        let mut db = create_volatile_db();
+
+        // Rollback to slot 25 (between 20 and 30)
+        let rollback_point = Point::Specific(Slot::from(25), Hash::new([0u8; 32]));
+
+        let result = db.rollback_to(&rollback_point, |_| "Point not found");
+
+        // This should succeed and keep elements at slots 10 and 20
+        assert!(result.is_ok());
+        assert_eq!(db.len(), 2, "Should keep elements at slots 10 and 20");
+    }
+
+    // HELPERS
+
+    fn create_test_state(slot: u64, pool_id: u8) -> AnchoredVolatileState {
+        let point = Point::Specific(Slot::from(slot), Hash::new([0u8; 32]));
+        let pool = Hash::new([pool_id; 28]);
+
+        AnchoredVolatileState { anchor: (point, pool), state: VolatileState::default() }
+    }
+
+    fn create_volatile_db() -> VolatileDB {
+        let mut db = VolatileDB::default();
+        db.push_back(create_test_state(10, 1));
+        db.push_back(create_test_state(20, 2));
+        db.push_back(create_test_state(30, 3));
+
+        assert_eq!(db.len(), 3);
+        db
+    }
 }

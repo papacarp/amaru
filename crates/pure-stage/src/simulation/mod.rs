@@ -12,19 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![expect(
-    clippy::wildcard_enum_match_arm,
-    clippy::unwrap_used,
-    clippy::panic,
-    clippy::expect_used
-)]
+#![expect(clippy::wildcard_enum_match_arm, clippy::unwrap_used, clippy::panic, clippy::expect_used)]
 
 mod blocked;
 mod inputs;
-mod replay;
-mod resume;
+mod random;
+pub mod replay;
 pub mod running;
 pub mod simulation_builder;
 mod state;
 
+pub use blocked::{Blocked, SendBlock};
+pub use random::{EvalStrategy, Fifo, RandStdRng};
+pub use running::SimulationRunning;
 pub use simulation_builder::SimulationBuilder;
+pub use state::Transition;

@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::effect::StageEffect;
-use crate::{BoxFuture, Name, SendData};
 use std::{collections::VecDeque, fmt};
+
+use crate::{BoxFuture, Name, SendData, effect::StageEffect};
 
 pub enum InitStageState {
     Uninitialized,
@@ -30,9 +30,8 @@ impl std::fmt::Debug for InitStageState {
     }
 }
 
-pub type Transition = Box<
-    dyn FnMut(Box<dyn SendData>, Box<dyn SendData>) -> BoxFuture<'static, Box<dyn SendData>> + Send,
->;
+pub type Transition =
+    Box<dyn FnMut(Box<dyn SendData>, Box<dyn SendData>) -> BoxFuture<'static, Box<dyn SendData>> + Send>;
 
 pub struct InitStageData {
     pub mailbox: VecDeque<Box<dyn SendData>>,
@@ -40,10 +39,16 @@ pub struct InitStageData {
     pub transition: Transition,
 }
 
+impl fmt::Debug for InitStageData {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("InitStageData").field("mailbox", &self.mailbox).field("state", &self.state).finish()
+    }
+}
+
 pub enum StageState {
     Idle(Box<dyn SendData>),
     Running(BoxFuture<'static, Box<dyn SendData>>),
-    Failed(String),
+    Terminating,
 }
 
 impl fmt::Debug for StageState {
@@ -51,7 +56,7 @@ impl fmt::Debug for StageState {
         match self {
             Self::Idle(arg0) => f.debug_tuple("Idle").field(arg0).finish(),
             Self::Running(_) => f.debug_tuple("Running").finish(),
-            Self::Failed(error) => f.debug_tuple("Failed").field(error).finish(),
+            Self::Terminating => f.debug_tuple("Terminating").finish(),
         }
     }
 }
@@ -59,8 +64,11 @@ impl fmt::Debug for StageState {
 pub(crate) struct StageData {
     pub name: Name,
     pub mailbox: VecDeque<Box<dyn SendData>>,
+    pub tombstones: VecDeque<Result<Box<dyn SendData>, Name>>,
     pub state: StageState,
     pub waiting: Option<StageEffect<()>>,
     pub transition: Transition,
     pub senders: VecDeque<(Name, Box<dyn SendData>)>,
+    pub supervised_by: Name,
+    pub tombstone: Option<Box<dyn SendData>>,
 }

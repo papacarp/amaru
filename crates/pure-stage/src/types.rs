@@ -12,23 +12,24 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::{
+    any::{Any, type_name},
+    borrow::Borrow,
+    fmt::{self, Display, Formatter},
+    future::Future,
+    ops::{Deref, DerefMut},
+    pin::Pin,
+    sync::{Arc, LazyLock},
+};
+
+use anyhow::Context;
+use cbor4ii::serde::from_slice;
+use tokio::sync::mpsc;
+
 use crate::{
     Effects, UnknownExternalEffect,
     serde::{SendDataValue, to_cbor},
 };
-use anyhow::Context;
-use cbor4ii::serde::from_slice;
-use std::fmt::{Display, Error, Formatter};
-use std::{
-    any::{Any, type_name},
-    borrow::Borrow,
-    fmt,
-    future::Future,
-    ops::{Deref, DerefMut},
-    pin::Pin,
-    sync::Arc,
-};
-use tokio::sync::mpsc;
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -50,13 +51,7 @@ pub trait SendData: Any + fmt::Debug + Send + 'static {
 
 impl<T> SendData for T
 where
-    T: Any
-        + PartialEq
-        + fmt::Debug
-        + serde::Serialize
-        + serde::de::DeserializeOwned
-        + Send
-        + 'static,
+    T: Any + PartialEq + fmt::Debug + serde::Serialize + serde::de::DeserializeOwned + Send + 'static,
 {
     fn typetag_name(&self) -> &'static str {
         type_name::<T>()
@@ -74,26 +69,47 @@ where
     }
 }
 
+impl SendData for Box<dyn SendData> {
+    fn test_eq(&self, other: &dyn SendData) -> bool {
+        (**self).test_eq(other)
+    }
+
+    fn deserialize_value(&self, other: &dyn SendData) -> anyhow::Result<Box<dyn SendData>> {
+        (**self).deserialize_value(other)
+    }
+
+    fn typetag_name(&self) -> &'static str {
+        (**self).typetag_name()
+    }
+}
+
 impl Display for dyn SendData {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        f.write_str(&as_send_data_value(self).map_err(|_| Error)?.to_string())
+        write!(f, "{}", self.as_send_data_value().borrow())
     }
 }
 
 impl dyn SendData {
-    /// Cast a message to a given concrete type.
-    pub fn cast_ref<T: SendData>(&self) -> Option<&T> {
-        (self as &dyn Any).downcast_ref::<T>()
+    pub fn is<T: SendData>(&self) -> bool {
+        (self as &dyn Any).is::<T>()
     }
 
-    fn try_cast<T: SendData>(self: Box<Self>) -> Result<Box<T>, Box<Self>> {
+    /// Cast a message to a given concrete type.
+    pub fn cast_ref<T: SendData>(&self) -> anyhow::Result<&T> {
+        (self as &dyn Any).downcast_ref::<T>().ok_or_else(|| {
+            anyhow::anyhow!(
+                "message type error: expected {}, got {:?} ({})",
+                type_name::<T>(),
+                self,
+                self.typetag_name()
+            )
+        })
+    }
+
+    pub fn try_cast<T: SendData>(self: Box<Self>) -> Result<Box<T>, Box<Self>> {
         if (&*self as &dyn Any).is::<T>() {
             #[expect(clippy::expect_used)]
-            Ok(Box::new(
-                *(self as Box<dyn Any>)
-                    .downcast::<T>()
-                    .expect("checked above"),
-            ))
+            Ok(Box::new(*(self as Box<dyn Any>).downcast::<T>().expect("checked above")))
         } else {
             Err(self)
         }
@@ -102,12 +118,7 @@ impl dyn SendData {
     /// Cast a message to a given concrete type, yielding an informative error otherwise
     pub fn cast<T: SendData>(self: Box<Self>) -> anyhow::Result<Box<T>> {
         self.try_cast::<T>().map_err(|b| {
-            anyhow::anyhow!(
-                "message type error: expected {}, got {:?} ({})",
-                type_name::<T>(),
-                b,
-                b.typetag_name()
-            )
+            anyhow::anyhow!("message type error: expected {}, got {:?} ({})", type_name::<T>(), b, b.typetag_name())
         })
     }
 
@@ -119,43 +130,41 @@ impl dyn SendData {
             Ok(that) => return Ok(*that),
             Err(this) => this,
         };
-        deserialize_value::<T>(&*this)
+        deserialize_value::<T>(&*this).with_context(|| format!("deserializing `{}`", type_name::<T>()))
     }
-}
 
-/// Cast the SendData to a SendDataValue to be able to access its inner value.
-pub fn as_send_data_value(this: &dyn SendData) -> anyhow::Result<&SendDataValue> {
-    let Some(this) = this.cast_ref::<SendDataValue>() else {
-        let Some(this) = this.cast_ref::<UnknownExternalEffect>() else {
-            anyhow::bail!(
-                "message type error: expected SendDataValue, got {:?} ({})",
-                this,
-                this.typetag_name()
-            )
-        };
-        return Ok(this.send_data_value());
-    };
-    Ok(this)
+    /// Cast the SendData to a SendDataValue to be able to access its inner value.
+    pub fn as_send_data_value(&self) -> impl Borrow<SendDataValue> {
+        enum B<'a> {
+            Borrowed(&'a SendDataValue),
+            Owned(SendDataValue),
+        }
+        impl<'a> Borrow<SendDataValue> for B<'a> {
+            fn borrow(&self) -> &SendDataValue {
+                match self {
+                    B::Borrowed(value) => value,
+                    B::Owned(value) => value,
+                }
+            }
+        }
+
+        if let Ok(this) = self.cast_ref::<SendDataValue>() {
+            return B::Borrowed(this);
+        }
+        if let Ok(this) = self.cast_ref::<UnknownExternalEffect>() {
+            return B::Borrowed(this.send_data_value());
+        }
+        B::Owned(SendDataValue::from(self))
+    }
 }
 
 pub fn deserialize_value<T>(this: &dyn SendData) -> anyhow::Result<T>
 where
     T: SendData + serde::de::DeserializeOwned,
 {
-    let Some(this) = this.cast_ref::<SendDataValue>() else {
-        anyhow::bail!(
-            "message type error: expected {}, got {:?} ({})",
-            type_name::<T>(),
-            this,
-            this.typetag_name()
-        )
-    };
+    let this = this.cast_ref::<SendDataValue>()?;
     let bytes = to_cbor(&this.value);
-    from_slice::<T>(&bytes).context(format!(
-        "deserializing `{}` from {:?}",
-        type_name::<T>(),
-        this
-    ))
+    from_slice::<T>(&bytes).context(format!("deserializing `{}` from {:?}", type_name::<T>(), this))
 }
 
 impl PartialEq for dyn SendData {
@@ -164,14 +173,23 @@ impl PartialEq for dyn SendData {
     }
 }
 
+#[derive(Debug, PartialEq, Eq, Clone, Copy, serde::Serialize, serde::Deserialize)]
+pub enum Void {}
+
+impl Display for Void {
+    fn fmt(&self, _f: &mut Formatter<'_>) -> fmt::Result {
+        match *self {}
+    }
+}
+
 /// A unique identifier for a stage in the simulation.
 ///
 /// This is used to identify stages in the simulation, and is used in messages sent to other stages.
 /// A Name is cheap to clone and compare, and can be used as a key in a [`HashMap`](std::collections::HashMap).
-#[derive(
-    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
-)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub struct Name(Arc<str>);
+
+pub static BLACKHOLE_NAME: LazyLock<Name> = LazyLock::new(|| Name(Arc::from("")));
 
 impl Name {
     pub fn as_str(&self) -> &str {
@@ -184,11 +202,21 @@ impl Name {
         new.push_str(other);
         Self(new.into())
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
 }
 
 impl AsRef<str> for Name {
     fn as_ref(&self) -> &str {
         self.as_str()
+    }
+}
+
+impl AsRef<Name> for Name {
+    fn as_ref(&self) -> &Name {
+        self
     }
 }
 
@@ -222,9 +250,7 @@ fn dummy_sender<T>() -> mpsc::Sender<T> {
 
 impl<T: Any> fmt::Debug for MpscSender<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("MpscSender")
-            .field(&std::any::type_name::<T>())
-            .finish()
+        f.debug_tuple("MpscSender").field(&std::any::type_name::<T>()).finish()
     }
 }
 
@@ -261,9 +287,7 @@ fn dummy_receiver<T>() -> mpsc::Receiver<T> {
 
 impl<T: Any> fmt::Debug for MpscReceiver<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("MpscReceiver")
-            .field(&std::any::type_name::<T>())
-            .finish()
+        f.debug_tuple("MpscReceiver").field(&std::any::type_name::<T>()).finish()
     }
 }
 
@@ -310,63 +334,87 @@ pub trait TryInStage {
     ///     tracing::info!("received message: {}", msg);
     /// });
     /// ```
-    #[allow(async_fn_in_trait)]
-    async fn or_terminate<M>(
+    fn or_terminate<'a, M: Send + 'static, F, Fut>(
         self,
-        eff: &Effects<M>,
-        alt: impl AsyncFnOnce(Self::Error),
-    ) -> Self::Result;
+        eff: &'a Effects<M>,
+        alt: F,
+    ) -> impl Future<Output = Self::Result> + Send + 'a
+    where
+        F: FnOnce(Self::Error) -> Fut + 'a + Send,
+        Fut: Future<Output = ()> + Send + 'a;
 }
 
-impl<T> TryInStage for Option<T> {
+impl<T: Send + 'static> TryInStage for Option<T> {
     type Result = T;
     type Error = ();
 
-    async fn or_terminate<M>(
+    fn or_terminate<'a, M: Send + 'static, F, Fut>(
         self,
-        eff: &Effects<M>,
-        alt: impl AsyncFnOnce(Self::Error),
-    ) -> Self::Result {
-        match self {
-            Some(value) => value,
-            None => {
-                alt(()).await;
-                eff.terminate().await
+        eff: &'a Effects<M>,
+        alt: F,
+    ) -> impl Future<Output = Self::Result> + Send + 'a
+    where
+        F: FnOnce(Self::Error) -> Fut + 'a + Send,
+        Fut: Future<Output = ()> + Send + 'a,
+    {
+        let eff = eff.clone();
+        async move {
+            match self {
+                Some(value) => value,
+                None => {
+                    alt(()).await;
+                    eff.terminate().await
+                }
             }
         }
     }
 }
 
-impl<T, E> TryInStage for Result<T, E> {
+impl<T: Send + 'static, E: Send + 'static> TryInStage for Result<T, E> {
     type Result = T;
 
     type Error = E;
 
-    async fn or_terminate<M>(
+    fn or_terminate<'a, M: Send + 'static, F, Fut>(
         self,
-        eff: &Effects<M>,
-        alt: impl AsyncFnOnce(Self::Error),
-    ) -> Self::Result {
-        match self {
-            Ok(value) => value,
-            Err(error) => {
-                alt(error).await;
-                eff.terminate().await
+        eff: &'a Effects<M>,
+        alt: F,
+    ) -> impl Future<Output = Self::Result> + Send + 'a
+    where
+        F: FnOnce(Self::Error) -> Fut + 'a + Send,
+        Fut: Future<Output = ()> + Send + 'a,
+    {
+        let eff = eff.clone();
+        async move {
+            match self {
+                Ok(value) => value,
+                Err(error) => {
+                    alt(error).await;
+                    eff.terminate().await
+                }
             }
         }
     }
 }
 
-#[cfg(feature = "simulation")]
+pub fn err<'a, E: std::fmt::Display + Send + 'a>(msg: &'a str) -> impl FnOnce(E) -> BoxFuture<'a, ()> {
+    move |err| Box::pin(async move { tracing::error!(%err, "{}", msg) })
+}
+
+pub fn warn<'a, E: std::fmt::Display + Send + 'a>(msg: &'a str) -> impl FnOnce(E) -> BoxFuture<'a, ()> {
+    move |err| Box::pin(async move { tracing::warn!(%err, "{}", msg) })
+}
+
 #[cfg(test)]
 mod test {
-    use crate::simulation::SimulationBuilder;
+    use std::{ffi::OsString, time::Duration};
+
     use crate::{
         Effect, Instant, SendData, StageGraph, StageGraphRunning, StageResponse, TryInStage,
         serde::SendDataValue,
-        trace_buffer::{TraceBuffer, TraceEntry},
+        simulation::SimulationBuilder,
+        trace_buffer::{TerminationReason, TraceBuffer, TraceEntry},
     };
-    use std::{ffi::OsString, time::Duration};
 
     #[test]
     fn message() {
@@ -408,13 +456,11 @@ mod test {
     fn try_in_stage_option() {
         let trace = TraceBuffer::new_shared(100, 1_000_000);
         let mut network = SimulationBuilder::default().with_trace_buffer(trace.clone());
-        let stage = network.stage("stage", async |_: u32, msg: Option<u32>, eff| {
-            msg.or_terminate(&eff, async |_| ()).await
-        });
+        let stage =
+            network.stage("stage", async |_: u32, msg: Option<u32>, eff| msg.or_terminate(&eff, async |_| ()).await);
         let stage = network.wire_up(stage, 0);
 
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let mut sim = network.run(rt.handle().clone());
+        let mut sim = network.run();
 
         sim.enqueue_msg(&stage, [Some(1)]);
         sim.run_until_blocked();
@@ -425,16 +471,16 @@ mod test {
         assert!(sim.is_terminated());
 
         pretty_assertions::assert_eq!(
-            trace.lock().hydrate(),
+            trace.lock().hydrate_without_timestamps(),
             vec![
-                TraceEntry::state("stage-0", SendDataValue::boxed(0u32)),
-                TraceEntry::input("stage-0", SendDataValue::boxed(Some(1u32))),
-                TraceEntry::resume("stage-0", StageResponse::Unit),
-                TraceEntry::state("stage-0", SendDataValue::boxed(1u32)),
-                TraceEntry::suspend(Effect::receive("stage-0")),
-                TraceEntry::input("stage-0", SendDataValue::boxed(None::<u32>)),
-                TraceEntry::resume("stage-0", StageResponse::Unit),
-                TraceEntry::suspend(Effect::terminate("stage-0"))
+                TraceEntry::state("stage-1", SendDataValue::boxed(&0u32)),
+                TraceEntry::input("stage-1", SendDataValue::boxed(&Some(1u32))),
+                TraceEntry::resume("stage-1", StageResponse::Unit),
+                TraceEntry::state("stage-1", SendDataValue::boxed(&1u32)),
+                TraceEntry::input("stage-1", SendDataValue::boxed(&None::<u32>)),
+                TraceEntry::resume("stage-1", StageResponse::Unit),
+                TraceEntry::suspend(Effect::terminate("stage-1")),
+                TraceEntry::terminated("stage-1", TerminationReason::Voluntary),
             ]
         );
     }
@@ -442,7 +488,7 @@ mod test {
     #[test]
     fn try_in_stage_result() {
         let trace = TraceBuffer::new_shared(100, 1_000_000);
-        let mut network = SimulationBuilder::default().with_trace_buffer(trace.clone());
+        let mut network = SimulationBuilder::default().with_trace_buffer(trace.clone()).with_epoch_clock();
         let stage = network.stage("stage", async |_: u32, msg: Result<u32, u32>, eff| {
             msg.or_terminate(&eff, async |error| {
                 eff.wait(Duration::from_secs(error.into())).await;
@@ -451,8 +497,7 @@ mod test {
         });
         let stage = network.wire_up(stage, 0);
 
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let mut sim = network.run(rt.handle().clone());
+        let mut sim = network.run();
 
         sim.enqueue_msg(&stage, [Ok(1)]);
         sim.run_until_blocked();
@@ -464,19 +509,19 @@ mod test {
 
         let two_sec = Instant::at_offset(Duration::from_secs(2));
         pretty_assertions::assert_eq!(
-            trace.lock().hydrate(),
+            trace.lock().hydrate_without_timestamps(),
             vec![
-                TraceEntry::state("stage-0", SendDataValue::boxed(0u32)),
-                TraceEntry::input("stage-0", SendDataValue::boxed(Ok::<_, u32>(1u32))),
-                TraceEntry::resume("stage-0", StageResponse::Unit),
-                TraceEntry::state("stage-0", SendDataValue::boxed(1u32)),
-                TraceEntry::suspend(Effect::receive("stage-0")),
-                TraceEntry::input("stage-0", SendDataValue::boxed(Err::<u32, _>(2u32))),
-                TraceEntry::resume("stage-0", StageResponse::Unit),
-                TraceEntry::suspend(Effect::wait("stage-0", Duration::from_secs(2))),
+                TraceEntry::state("stage-1", SendDataValue::boxed(&0u32)),
+                TraceEntry::input("stage-1", SendDataValue::boxed(&Ok::<_, u32>(1u32))),
+                TraceEntry::resume("stage-1", StageResponse::Unit),
+                TraceEntry::state("stage-1", SendDataValue::boxed(&1u32)),
+                TraceEntry::input("stage-1", SendDataValue::boxed(&Err::<u32, _>(2u32))),
+                TraceEntry::resume("stage-1", StageResponse::Unit),
+                TraceEntry::suspend(Effect::wait("stage-1", Duration::from_secs(2))),
                 TraceEntry::clock(two_sec),
-                TraceEntry::resume("stage-0", StageResponse::WaitResponse(two_sec)),
-                TraceEntry::suspend(Effect::terminate("stage-0"))
+                TraceEntry::resume("stage-1", StageResponse::WaitResponse(two_sec)),
+                TraceEntry::suspend(Effect::terminate("stage-1")),
+                TraceEntry::terminated("stage-1", TerminationReason::Voluntary),
             ]
         );
     }

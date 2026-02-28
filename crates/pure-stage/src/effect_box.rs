@@ -16,22 +16,23 @@
 //! used to build and run a simulation.
 //!
 //! The simulation is a fully controllable and deterministic [`StageGraph`](crate::StageGraph) for testing purposes.
-//! Execution is controlled entirely via the [`SimulationRunning`] handle returned from
-//! [`StageGraph::run`](crate::StageGraph::run).
+//! Execution is controlled entirely via the [`SimulationRunning`](crate::simulation::SimulationRunning) handle returned from
+//! [`SimulationBuilder::run`](crate::simulation::SimulationBuilder::run).
 //!
 
 #![expect(clippy::panic)]
+
+use std::{future::poll_fn, sync::Arc, task::Poll};
+
+use either::Either;
+use parking_lot::Mutex;
 
 use crate::{
     BoxFuture, SendData,
     effect::{StageEffect, StageResponse},
 };
-use either::Either;
-use parking_lot::Mutex;
-use std::{future::poll_fn, sync::Arc, task::Poll};
 
-pub(crate) type EffectBox =
-    Arc<Mutex<Option<Either<StageEffect<Box<dyn SendData>>, StageResponse>>>>;
+pub(crate) type EffectBox = Arc<Mutex<Option<Either<StageEffect<Box<dyn SendData>>, StageResponse>>>>;
 
 pub(crate) fn airlock_effect<Out>(
     eb: &EffectBox,

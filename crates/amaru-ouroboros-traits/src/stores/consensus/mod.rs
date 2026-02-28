@@ -14,11 +14,14 @@
 
 pub mod in_memory_consensus_store;
 
-use crate::Nonces;
-use amaru_kernel::{BlockHeader, HeaderHash, IsHeader, Point, RawBlock};
-use std::fmt::Display;
-use std::iter::successors;
+use std::{fmt::Display, iter::successors, sync::Arc};
+
+use amaru_kernel::{
+    Block, BlockHeader, HeaderHash, IsHeader, Point, RawBlock, Tip, cardano::network_block::NetworkBlock,
+};
 use thiserror::Error;
+
+use crate::Nonces;
 
 pub trait ReadOnlyChainStore<H>
 where
@@ -39,9 +42,14 @@ where
     /// `Point`, if it exists.
     fn next_best_chain(&self, point: &Point) -> Option<Point>;
 
-    fn load_block(&self, hash: &HeaderHash) -> Result<RawBlock, StoreError>;
+    fn load_block(&self, hash: &HeaderHash) -> Result<Option<RawBlock>, StoreError>;
     fn get_nonces(&self, header: &HeaderHash) -> Option<Nonces>;
     fn has_header(&self, hash: &HeaderHash) -> bool;
+
+    /// Retrieve the tip of a block header given its hash.
+    fn load_tip(&self, hash: &HeaderHash) -> Option<Tip> {
+        self.load_header(hash).map(|h| h.tip())
+    }
 
     /// Return the hashes of the best chain fragment, starting from the anchor.
     fn retrieve_best_chain(&self) -> Vec<HeaderHash> {
@@ -63,14 +71,19 @@ where
     }
 
     /// Return the ancestors of the header, including the header itself.
-    /// Stop at the anchor of the tree.
+    /// Stop if the followed chain reaches past the anchor.
     fn ancestors<'a>(&'a self, start: H) -> Box<dyn Iterator<Item = H> + 'a>
     where
         H: 'a,
     {
         let anchor = self.get_anchor_hash();
+        let anchor_point = match self.load_header(&anchor) {
+            Some(header) => header.point(),
+            None => Point::Origin,
+        };
+
         Box::new(successors(Some(start), move |h| {
-            if h.hash() == anchor {
+            if h.slot() <= anchor_point.slot_or_default() {
                 None
             } else {
                 h.parent().and_then(|p| self.load_header(&p))
@@ -79,10 +92,7 @@ where
     }
 
     /// Return the hashes of the ancestors of the header, including the header hash itself.
-    fn ancestors_hashes<'a>(
-        &'a self,
-        hash: &HeaderHash,
-    ) -> Box<dyn Iterator<Item = HeaderHash> + 'a>
+    fn ancestors_hashes<'a>(&'a self, hash: &HeaderHash) -> Box<dyn Iterator<Item = HeaderHash> + 'a>
     where
         H: 'a,
     {
@@ -105,8 +115,7 @@ pub trait DiagnosticChainStore {
     /// Load all nonces in the store.
     fn load_nonces(&self) -> Box<dyn Iterator<Item = (HeaderHash, Nonces)> + '_>;
     fn load_blocks(&self) -> Box<dyn Iterator<Item = (HeaderHash, RawBlock)> + '_>;
-    fn load_parents_children(&self)
-    -> Box<dyn Iterator<Item = (HeaderHash, Vec<HeaderHash>)> + '_>;
+    fn load_parents_children(&self) -> Box<dyn Iterator<Item = (HeaderHash, Vec<HeaderHash>)> + '_>;
 }
 
 impl<H: IsHeader> ReadOnlyChainStore<H> for Box<dyn ChainStore<H>> {
@@ -126,7 +135,7 @@ impl<H: IsHeader> ReadOnlyChainStore<H> for Box<dyn ChainStore<H>> {
         self.as_ref().get_best_chain_hash()
     }
 
-    fn load_block(&self, hash: &HeaderHash) -> Result<RawBlock, StoreError> {
+    fn load_block(&self, hash: &HeaderHash) -> Result<Option<RawBlock>, StoreError> {
         self.as_ref().load_block(hash)
     }
 
@@ -173,7 +182,6 @@ pub enum StoreError {
     WriteError { error: String },
     ReadError { error: String },
     OpenError { error: String },
-    NotFound { hash: HeaderHash },
     IncompatibleChainStoreVersions { stored: u16, current: u16 },
 }
 
@@ -183,12 +191,43 @@ impl Display for StoreError {
             StoreError::WriteError { error } => write!(f, "WriteError: {}", error),
             StoreError::ReadError { error } => write!(f, "ReadError: {}", error),
             StoreError::OpenError { error } => write!(f, "OpenError: {}", error),
-            StoreError::NotFound { hash } => write!(f, "NotFound: {}", hash),
-            StoreError::IncompatibleChainStoreVersions { stored, current } => write!(
-                f,
-                "Incompatible DB Versions: found {}, expected {}",
-                stored, current
-            ),
+            StoreError::IncompatibleChainStoreVersions { stored, current } => {
+                write!(f, "Incompatible DB Versions: found {}, expected {}", stored, current)
+            }
         }
     }
+}
+
+/// Retrieve all blocks from the chain store starting from the anchor to the best chain tip.
+#[cfg(feature = "test-utils")]
+#[expect(clippy::expect_used)]
+pub fn get_blocks(store: Arc<dyn ChainStore<BlockHeader>>) -> Vec<(HeaderHash, Block)> {
+    store
+        .retrieve_best_chain()
+        .iter()
+        .map(|h| {
+            let b = store
+                .load_block(h)
+                .expect("load_block should not raise an error")
+                .expect("missing block for a header on the best chain");
+            (
+                *h,
+                NetworkBlock::try_from(b)
+                    .expect("failed to decode raw block")
+                    .decode_block()
+                    .expect("failed to decode block"),
+            )
+        })
+        .collect()
+}
+
+/// Retrieve all blocks headers from the chain store starting from anchor to the best chain tip.
+#[cfg(feature = "test-utils")]
+#[expect(clippy::expect_used)]
+pub fn get_best_chain_block_headers(store: Arc<dyn ChainStore<BlockHeader>>) -> Vec<BlockHeader> {
+    store
+        .retrieve_best_chain()
+        .iter()
+        .map(|h| store.load_header(h).expect("missing header for the best chain"))
+        .collect()
 }

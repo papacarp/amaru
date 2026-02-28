@@ -12,10 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use amaru_kernel::{BlockHeader, Point, RawBlock};
+use std::fmt::{Debug, Display, Formatter};
+
+use amaru_kernel::{Block, BlockHeader, Point};
 use amaru_metrics::ledger::LedgerMetrics;
 use serde::{Deserialize, Serialize};
-use std::fmt::{Debug, Display, Formatter};
+use thiserror::Error;
 
 pub mod mock;
 
@@ -24,12 +26,12 @@ pub trait CanValidateBlocks: Send + Sync {
     async fn roll_forward_block(
         &self,
         point: &Point,
-        block: &RawBlock,
+        block: Block,
     ) -> Result<Result<LedgerMetrics, BlockValidationError>, BlockValidationError>;
 
     fn rollback_block(&self, to: &Point) -> Result<(), BlockValidationError>;
 }
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub struct BlockValidationError(anyhow::Error);
 
 impl BlockValidationError {
@@ -41,9 +43,7 @@ impl BlockValidationError {
         self.0
     }
 
-    pub fn downcast<T: std::error::Error + Debug + Send + Sync + 'static>(
-        self,
-    ) -> Result<T, anyhow::Error> {
+    pub fn downcast<T: std::error::Error + Debug + Send + Sync + 'static>(self) -> Result<T, anyhow::Error> {
         self.0.downcast::<T>()
     }
 
@@ -108,9 +108,7 @@ impl HeaderValidationError {
         self.0
     }
 
-    pub fn downcast<T: std::error::Error + Debug + Send + Sync + 'static>(
-        self,
-    ) -> Result<T, anyhow::Error> {
+    pub fn downcast<T: std::error::Error + Debug + Send + Sync + 'static>(self) -> Result<T, anyhow::Error> {
         self.0.downcast::<T>()
     }
 

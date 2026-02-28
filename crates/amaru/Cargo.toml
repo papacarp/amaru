@@ -12,27 +12,47 @@ homepage.workspace = true
 documentation.workspace = true
 rust-version.workspace = true
 build = "build.rs"
+include = ["src/**/*", "config/**", "Cargo.toml"]
+default-run = "amaru"
+
+[[bin]]
+name = "amaru"
+path = "src/bin/amaru/main.rs"
+doc = false
+
+[[bin]]
+name = "amaru-ledger"
+path = "src/bin/ledger/main.rs"
+doc = false
 
 [dependencies]
 # External dependencies ───────────────────────────────────────────────────────┐
-acto.workspace = true
 anyhow.workspace = true
 async-compression.workspace = true
 async-trait.workspace = true
 clap.workspace = true
+flate2.workspace = true
 futures-util.workspace = true
 hex.workspace = true
+include_dir = { workspace = true, features = ["glob"] }
+indicatif.workspace = true
 indoc.workspace = true
 minicbor.workspace = true
+mithril-client = { workspace = true, optional = true }
 opentelemetry-otlp.workspace = true
+opentelemetry-semantic-conventions.workspace = true
 opentelemetry.workspace = true
 opentelemetry_sdk.workspace = true
+pallas-hardano.workspace = true
 pallas-network.workspace = true
+parking_lot.workspace = true
+rayon.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 cbor4ii.workspace = true
 sysinfo.workspace = true
+tar.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = [
   "fs",
@@ -47,25 +67,30 @@ tracing-subscriber.workspace = true
 tracing.workspace = true
 
 # Internal dependencies ───────────────────────────────────────────────────────┐
-amaru-consensus = { workspace = true, features = [] }
+amaru-consensus = { workspace = true, features = ["test-utils"] }
 amaru-kernel = { workspace = true, features = ["tracing"] }
 amaru-ledger.workspace = true
-amaru-network.workspace = true
-amaru-stores.workspace = true
-amaru-ouroboros-traits.workspace = true
-amaru-progress-bar = { workspace = true, features = ["terminal"] }
-amaru-slot-arithmetic.workspace = true
+amaru-mempool.workspace = true
 amaru-metrics.workspace = true
+amaru-network.workspace = true
+amaru-observability.workspace = true
+amaru-ouroboros.workspace = true
+amaru-plutus.workspace = true
+amaru-progress-bar = { workspace = true, features = ["terminal"] }
+amaru-protocols.workspace = true
+amaru-stores.workspace = true
 pure-stage.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 rlimit = "0.10.2"
 
+[features]
+default = ["mithril"]
+mithril = ["dep:mithril-client"]
+
 [dev-dependencies]
 # External dependencies ───────────────────────────────────────────────────────┐
 insta = { workspace = true, features = ["json"] }
-proptest.workspace = true
-rand.workspace = true
 tempfile.workspace = true
 test-case.workspace = true
 rocksdb.workspace = true
@@ -73,7 +98,12 @@ rocksdb.workspace = true
 # Internal dependencies ───────────────────────────────────────────────────────┐
 amaru-iter-borrow.workspace = true
 amaru-kernel = { workspace = true, features = ["test-utils"] }
+amaru-ouroboros-traits = { workspace = true, features = ["test-utils"] }
 
 [build-dependencies]
 built = { workspace = true, features = ["git2"] }
 amaru-kernel.workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["-D", "warnings"]

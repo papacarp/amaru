@@ -2,6 +2,21 @@ name: Continuous Integration
 
 on:
   workflow_dispatch:
+    inputs:
+      network:
+        description: Network to run
+        type: choice
+        options: [preprod, preview]
+        required: false
+      demo_target_epoch:
+        description: "Override DEMO_TARGET_EPOCH (leave empty for fixed epoch)"
+        required: false
+      timeout:
+        description: "Override timeout for snapshot tests"
+        required: false
+      demo_trace_level:
+        description: "Override AMARU_TRACE (leave empty for default)"
+        required: false
   push:
     branches: ["main"]
   pull_request:
@@ -16,6 +31,11 @@ env:
     ~/.cargo/registry/cache/
     ~/.cargo/git/db/
     target/
+  RUSTUP_LOG: error
+
+permissions:
+  contents: read
+  actions: write
 
 jobs:
   build:
@@ -25,11 +45,11 @@ jobs:
       fail-fast: false
       matrix:
         environments:
-          - runner: ubuntu-latest
+          - runner: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             title: x86_64/linux
 
-          - runner: ubuntu-latest
+          - runner: ubuntu-22.04
             target: aarch64-unknown-linux-musl
             title: aarch64/linux
             command: test # This is a cross specific command. Do not change
@@ -43,25 +63,34 @@ jobs:
           - runner: windows-latest
             target: x86_64-pc-windows-msvc
             title: x86_64/windows
-            command: test-amaru --profile dev-debug
+            command: test --workspace --all-targets --profile dev-debug
 
-          - runner: ubuntu-latest
+          - runner: ubuntu-22.04
             target: wasm32-unknown-unknown
             title: wasm32
             packages: -p amaru-consensus -p amaru-ledger -p pure-stage
             command: build
             setup: rustup target add wasm32-unknown-unknown
 
-          - runner: ubuntu-latest
+          # When targetting RISC-V, the uplc-turbo crate fails to compile.
+          # Providing the specific RISC-V gnu clang compiler to Rust allows it to build
+          - runner: ubuntu-22.04
             target: riscv32gc-unknown-linux-gnu
             title: riscv32
-            packages: -p amaru-ledger -p amaru-slot-arithmetic
+            packages: -p amaru-ledger
             extra-args: +nightly -Zbuild-std=std,panic_abort
             command: build
-            setup: rustup component add rust-src --toolchain nightly
-
+            setup: |
+              rustup component add rust-src --toolchain nightly
+              curl -L -o riscv32-glibc-llvm.tar.xz \
+                "https://github.com/riscv-collab/riscv-gnu-toolchain/releases/download/2025.11.04/riscv32-glibc-ubuntu-22.04-llvm.tar.xz"
+              tar -xvf riscv32-glibc-llvm.tar.xz
+              export CC_riscv32gc_unknown_linux_gnu="$(pwd)/riscv/bin/riscv32-unknown-linux-gnu-clang"
     runs-on: ${{ matrix.environments.runner }}
     steps:
+      - name: Support longpaths
+        run: git config --system core.longpaths true
+        if: contains(matrix.environments.runner, 'windows')
       - uses: actions/checkout@v4
         with:
           submodules: true
@@ -86,11 +115,12 @@ jobs:
           restore-keys: |
             cargo-${{ matrix.environments.target }}
       - name: Run build
+        shell: bash
         run: |
           set -e
           EXTRA_ARGS="${{ matrix.environments.extra-args || '' }}"
           SCOPE="${{ matrix.environments.packages || '' }}"
-          COMMAND="${{ matrix.environments.command  || 'test-amaru' }}"
+          COMMAND="${{ matrix.environments.command  || 'test --workspace --all-targets' }}"
           if [[ -n "${{ matrix.environments.setup }}" ]]; then
             echo "Running setup command: ${{ matrix.environments.setup }}"
             ${{ matrix.environments.setup }}
@@ -108,7 +138,13 @@ jobs:
             # Run doc tests separately as --doc can't be used with --all-targets
             cargo test --doc
           fi
-        shell: bash
+
+      - name: Upload test artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: failed-simulation-data
+          path: simulation/amaru-sim/test-data
 
       - name: Upload test artifacts on failure
         if: failure()
@@ -119,7 +155,7 @@ jobs:
 
   coverage:
     name: Test coverage
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     if: ${{ !github.event.pull_request.draft }}
     env:
       CARGO_TERM_COLOR: always
@@ -136,6 +172,7 @@ jobs:
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
       - name: Generate code coverage
+        shell: bash
         run: make coverage-lconv
       - name: Upload test artifacts on failure
         if: failure()
@@ -151,154 +188,22 @@ jobs:
 
   snapshots:
     name: End-to-end snapshot tests
-    runs-on: ubuntu-latest
     if: ${{ !github.event.pull_request.draft }}
-    strategy:
-      matrix:
-        network:
-          - name: preprod
-            magic: 1
-        cardano_node_version: [10.1.4]
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Reclaim Disk Space
-        run: |
-          # based on https://github.com/actions/runner-images/issues/2840#issuecomment-790492173
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /opt/ghc
-          sudo rm -rf "/usr/local/share/boost"
-
-      - id: timestamp
-        shell: bash
-        run: |
-          echo "value=$(/bin/date -u '+%Y%m%d-%H%M%S')" >> $GITHUB_OUTPUT
-
-      - name: Restore cardano-node DB
-        id: cache-cardano-node-db
-        uses: actions/cache/restore@v4
-        with:
-          # The path should match the one used for the 'Nightly Sync' workflow.
-          path: ${{ runner.temp }}/db-${{ matrix.network.name }}
-          # The key should also match
-          key: cardano-node-ogmios-${{ matrix.network.name }}
-          restore-keys: |
-            cardano-node-ogmios-${{ matrix.network.name }}
-
-      - name: Check if cardano-node-db is available
-        if: steps.cache-cardano-node-db.outputs.cache-hit == ''
-        run: |
-          echo "Haskell node db not available, aborting job."
-          exit 1
-
-      - name: Spawn Haskell Node
-        id: spawn-cardano-node
-        shell: bash
-        run: |
-          docker pull ghcr.io/intersectmbo/cardano-node:${{ matrix.cardano_node_version }}
-          make HASKELL_NODE_CONFIG_DIR=cardano-node-config AMARU_NETWORK=${{ matrix.network.name }} download-haskell-config
-          docker run -d --name cardano-node \
-            -v ${{ runner.temp }}/db-${{ matrix.network.name }}:/db \
-            -v ${{ runner.temp }}/ipc:/ipc \
-            -v ./cardano-node-config:/config \
-            -v ./cardano-node-config:/genesis \
-            -p 3001:3001 \
-            ghcr.io/intersectmbo/cardano-node:${{ matrix.cardano_node_version }} run \
-              --config /config/config.json \
-              --database-path /db \
-              --socket-path /ipc/node.socket \
-              --topology /config/topology.json
-
-      - uses: actions/cache/restore@v4
-        with:
-          path: ${{ env.RUST_CACHE_PATH }}
-          key: cargo-x86_64-unknown-linux-gnu
-          restore-keys: |
-            cargo-x86_64-unknown-linux-gnu
-
-      - name: Build Amaru
-        run: |
-          cargo test --no-run -p amaru
-
-      - name: Cache Amaru's ledger.${{ matrix.network.name }}.db
-        id: cache-ledger-db
-        uses: actions/cache/restore@v4
-        with:
-          path: ./ledger.${{ matrix.network.name }}.db
-          # If the ledger store serialisation format changes and become
-          # incompatible, it is necessary to bump the index below to invalidate
-          # the cached ledger snapshots, and recompute them from the CBOR ones
-          # (i.e. Full bootstrap below)
-          key: ${{ runner.OS }}-ledger-cache-v12-${{ steps.timestamp.outputs.value }}
-          restore-keys: |
-            ${{ runner.OS }}-ledger-cache-v12
-
-      - name: Full bootstrap amaru
-        if: steps.cache-ledger-db.outputs.cache-hit == ''
-        run: |
-          make BUILD_PROFILE=test AMARU_NETWORK=${{ matrix.network.name }} bootstrap
-
-      - name: Light bootstrap amaru
-        if: steps.cache-ledger-db.outputs.cache-hit != ''
-        run: |
-          make BUILD_PROFILE=test AMARU_NETWORK=${{ matrix.network.name }} import-headers
-          make BUILD_PROFILE=test AMARU_NETWORK=${{ matrix.network.name }} import-nonces
-
-      - uses: actions/cache/save@v4
-        if: github.event_name == 'push' || steps.cache-ledger-db.outputs.cache-hit == ''
-        with:
-          path: ./ledger.${{ matrix.network.name }}.db
-          key: ${{ runner.OS }}-ledger-cache-v12-${{ steps.timestamp.outputs.value }}
-
-      - name: Run node
-        if: github.event_name == 'pull_request'
-        timeout-minutes: 10
-        shell: bash
-        run: make BUILD_PROFILE=test AMARU_MAX_EXTRA_LEDGER_SNAPSHOTS=all demo
-
-      - name: Install Cardano CLI
-        if: github.event_name != 'pull_request'
-        run: |
-          set -eux
-
-          VERSION="10.11.0.0"
-
-          curl -L -o cardano-cli.tar.gz \
-            "https://github.com/IntersectMBO/cardano-cli/releases/download/cardano-cli-${VERSION}/cardano-cli-${VERSION}-x86_64-linux.tar.gz"
-
-          mkdir -p cardano-cli-bin
-          tar -xzf cardano-cli.tar.gz -C cardano-cli-bin
-          mv cardano-cli-bin/cardano-cli* cardano-cli-bin/cardano-cli
-          ls $PWD/cardano-cli-bin/
-          chmod +x cardano-cli-bin/cardano-cli
-
-      - name: Run node until latest epoch (main branch only)
-        if: github.event_name != 'pull_request'
-        timeout-minutes: 60
-        shell: bash
-        run: |
-          set -eux
-
-          export DEMO_TARGET_EPOCH=$(sudo $PWD/cardano-cli-bin/cardano-cli query tip --socket-path ${{ runner.temp }}/ipc/node.socket --testnet-magic ${{ matrix.network.magic }} | jq '.epoch - 1')
-          make BUILD_PROFILE=test demo
-
-      - name: Run tests
-        if: github.event_name == 'pull_request'
-        run: |
-          make BUILD_PROFILE=test AMARU_NETWORK=${{ matrix.network.name }} test-e2e
-
-      - name: Teardown haskell node
-        shell: bash
-        run: |
-          docker stop cardano-node
-          docker rm cardano-node
-
-      - uses: actions/cache/save@v4
-        if: github.event_name == 'push'
-        with:
-          path: ${{ runner.temp }}/db-${{ matrix.network.name }}
-          key: cardano-node-ogmios-${{ matrix.network.name }}-${{ steps.timestamp.outputs.value }}
+    uses: ./.github/workflows/snapshot-tests.yml
+    with:
+      use_fixed_epoch: true
+      default_timeout: 15
+      network: ${{ github.event.inputs.network || '' }}
+      demo_target_epoch: ${{ github.event.inputs.demo_target_epoch || '' }}
+      timeout: ${{ github.event.inputs.timeout || '' }}
+      demo_trace_level: ${{ github.event.inputs.demo_trace_level || '' }}
+      use_buildjet_runner: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' }}
+      run_tests: ${{ github.event_name == 'pull_request' }}
+    secrets:
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      S3_ENDPOINT: ${{ secrets.S3_ENDPOINT }}
+      CARDANO_NODE_BUCKET_NAME: ${{ secrets.CARDANO_NODE_BUCKET_NAME }}
 
   examples:
     name: Examples
@@ -311,7 +216,7 @@ jobs:
       run:
         working-directory: examples/${{ matrix.projects }}
     timeout-minutes: 30
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/cache/restore@v4
@@ -321,11 +226,12 @@ jobs:
           restore-keys: |
             cargo-wasm32-unknown-unknown
       - name: Run make
+        shell: bash
         run: make
 
   benches:
     name: Benches
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/cache/restore@v4
@@ -335,11 +241,12 @@ jobs:
           restore-keys: |
             cargo-x86_64-unknown-linux-gnu
       - name: Run amaru-consensus benches
+        shell: bash
         run: cargo bench --bench headers_tree --features="test-utils profiling"
 
   cli:
     name: Test the CLI
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/cache/restore@v4
@@ -349,10 +256,98 @@ jobs:
           restore-keys: |
             cargo-x86_64-unknown-linux-gnu
       - name: Install bash_unit
+        shell: bash
         run: curl -s https://raw.githubusercontent.com/bash-unit/bash_unit/master/install.sh | bash
       - name: Install expect
+        shell: bash
         run: |
           sudo apt-get update
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y expect
       - name: Run bash_unit
+        shell: bash
         run: FORCE_COLOR=true ./bash_unit cli-tests/test_*
+
+  validate-schemas:
+    name: Validate Trace Schemas and Documentation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.RUST_CACHE_PATH }}
+          key: cargo-x86_64-unknown-linux-gnu
+          restore-keys: |
+            cargo-x86_64-unknown-linux-gnu
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+      - name: Generate current schemas
+        run: |
+          cargo run --bin amaru --quiet -- dump-traces-schema 2> /tmp/schemas-current.json
+      - name: Compare schemas
+        run: |
+          set -euo pipefail
+
+          # Canonicalize JSON to avoid formatting noise
+          # Remove 'private' field from comparison as it doesn't affect functionality
+          jq -S 'walk(if type == "object" then del(.private) else . end)' docs/traces-schema.json > /tmp/expected.json
+          jq -S 'walk(if type == "object" then del(.private) else . end)' /tmp/schemas-current.json > /tmp/current.json
+
+          if diff -u /tmp/expected.json /tmp/current.json > /tmp/schemas.diff; then
+            echo "✓ Schemas are up-to-date"
+          else
+            echo "::group::❌ Schema diff (expected → generated)"
+            diff --color=always -u /tmp/expected.json /tmp/current.json || true
+            echo "::endgroup::"
+
+            echo "::error title=Schema out of date::Generated schema does not match docs/traces-schema.json"
+
+            {
+              echo "## ❌ Schema mismatch"
+              echo ""
+              echo "The generated schema differs from \`docs/traces-schema.json\`."
+              echo ""
+              echo "**How to fix:**"
+              echo '```bash'
+              echo './scripts/generate-traces-doc'
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+
+            exit 1
+          fi
+      - name: Upload schema diff
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: schema-diff
+          path: /tmp/schemas.diff
+      - name: Build amaru release binary
+        run: cargo build --bin amaru --release --quiet
+      - name: Generate current TRACES.md
+        run: |
+          ./scripts/generate-traces-doc
+          cp docs/TRACES.md /tmp/TRACES-current.md
+          git checkout docs/TRACES.md
+      - name: Compare TRACES.md
+        run: |
+          if diff -u docs/TRACES.md /tmp/TRACES-current.md > /tmp/traces.diff; then
+            echo "✓ TRACES.md is up-to-date"
+          else
+            echo "✗ TRACES.md has changed!"
+            echo ""
+            echo "--- Expected (docs/TRACES.md)"
+            echo "+++ Current (generated)"
+            cat /tmp/traces.diff
+            exit 1
+          fi
+      - name: Show update instructions on failure
+        if: failure()
+        run: |
+          echo "Documentation changes detected. Please run:"
+          echo ""
+          echo "  ./scripts/generate-traces-doc"
+          echo ""
+          echo "If schemas changed, also run:"
+          echo ""
+          echo "  cargo run --bin amaru -- dump-traces-schema 2> docs/traces-schema.json"
+          echo ""
+          echo "Then commit the updated files."

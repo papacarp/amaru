@@ -12,11 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::point::{from_network_point, to_network_point};
-use amaru_kernel::{Point, peer::Peer};
+use amaru_kernel::{Peer, Point};
+use amaru_observability::trace;
 use pallas_network::miniprotocols::chainsync::{Client, ClientError, HeaderContent, NextResponse};
 use pallas_traverse::MultiEraHeader;
-use tracing::{Level, instrument};
+
+use crate::point::{from_network_point, to_network_point};
 
 pub type RawHeader = Vec<u8>;
 
@@ -48,38 +49,22 @@ pub struct ChainSyncClient {
 
 impl ChainSyncClient {
     pub fn new(peer: Peer, chain_sync: Client<HeaderContent>, intersection: Vec<Point>) -> Self {
-        Self {
-            peer,
-            chain_sync,
-            intersection,
-        }
+        Self { peer, chain_sync, intersection }
     }
 
-    #[instrument(
-        level = Level::TRACE,
-        skip_all,
-        name = "chainsync_client.find_intersection",
-        fields(
-            peer = self.peer.name,
-            intersection.slot = %self.intersection.last().map(|p| p.slot_or_default()).unwrap_or_default(),
-        ),
+    #[trace(amaru::network::chainsync_client::FIND_INTERSECTION,
+        peer = self.peer.name.clone(),
+        intersection_slot = u64::from(self.intersection.last().map(|p| p.slot_or_default()).unwrap_or_default())
     )]
     pub async fn find_intersection(&mut self) -> Result<Point, ChainSyncClientError> {
         let client = &mut self.chain_sync;
         let (point, _) = client
-            .find_intersect(
-                self.intersection
-                    .iter()
-                    .cloned()
-                    .map(to_network_point)
-                    .collect(),
-            )
+            .find_intersect(self.intersection.iter().cloned().map(to_network_point).collect())
             .await
             .map_err(ChainSyncClientError::NetworkError)?;
 
-        let intersection = point.ok_or(ChainSyncClientError::NoIntersectionFound {
-            points: self.intersection.clone(),
-        })?;
+        let intersection =
+            point.ok_or(ChainSyncClientError::NoIntersectionFound { points: self.intersection.clone() })?;
         Ok(from_network_point(&intersection))
     }
 
@@ -87,9 +72,7 @@ impl ChainSyncClient {
         &self.intersection
     }
 
-    pub async fn request_next(
-        &mut self,
-    ) -> Result<NextResponse<HeaderContent>, ChainSyncClientError> {
+    pub async fn request_next(&mut self) -> Result<NextResponse<HeaderContent>, ChainSyncClientError> {
         let client = &mut self.chain_sync;
 
         client
@@ -99,9 +82,7 @@ impl ChainSyncClient {
             .map_err(ChainSyncClientError::NetworkError)
     }
 
-    pub async fn await_next(
-        &mut self,
-    ) -> Result<NextResponse<HeaderContent>, ChainSyncClientError> {
+    pub async fn await_next(&mut self) -> Result<NextResponse<HeaderContent>, ChainSyncClientError> {
         let client = &mut self.chain_sync;
 
         match client.recv_while_must_reply().await {

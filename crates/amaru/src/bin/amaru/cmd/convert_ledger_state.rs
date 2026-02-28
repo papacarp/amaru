@@ -12,44 +12,51 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use amaru_kernel::{
-    Bound, EraHistory, EraParams, Hash, HeaderHash, Nonce, Point, Summary, cbor,
-    network::NetworkName,
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
 };
-use clap::Parser;
-use std::path::{Path, PathBuf};
+
+use amaru::{DEFAULT_NETWORK, bootstrap::InitialNonces};
+use amaru_kernel::{
+    EraBound, EraHistory, EraName, EraParams, EraSummary, Hash, HeaderHash, NetworkName, Nonce, Point, cbor,
+};
 use tokio::fs::{self};
 use tracing::{debug, info};
 
-use crate::cmd::import_nonces::InitialNonces;
-
-#[derive(Debug, Parser)]
+#[derive(Debug, clap::Parser)]
 pub struct Args {
-    /// Path to the CBOR encoded ledger state snapshot as serialised by Haskell
-    /// node.
-    #[arg(
-        long,
-        value_name = "FILE",
-        env = "AMARU_SNAPSHOT",
-        verbatim_doc_comment
-    )]
-    snapshot: PathBuf,
-
-    /// Directory to store converted snapshots into.
-    ///
-    /// Directory will be created if it does not exist, defaults to '.'.
-    #[arg(long, value_name = "DIR", verbatim_doc_comment)]
-    target_dir: Option<PathBuf>,
-
     /// Network to convert snapshots for.
     #[arg(
         long,
-        value_name = "NETWORK",
-        env = "AMARU_NETWORK",
-        default_value_t = super::DEFAULT_NETWORK,
-        verbatim_doc_comment
+        value_name = amaru::value_names::NETWORK,
+        env = amaru::env_vars::NETWORK,
+        default_value_t = DEFAULT_NETWORK,
     )]
     network: NetworkName,
+
+    /// Path to a CBOR encoded ledger state snapshot.
+    ///
+    /// Snapshot can be obtained from the Haskell cardano-node, using the `DebugEpochState` query, serialised as CBOR.
+    #[arg(
+        long,
+        value_name = amaru::value_names::FILEPATH,
+        env = amaru::env_vars::SNAPSHOT,
+    )]
+    snapshot: PathBuf,
+
+    /// Directory to store the converted snapshots into.
+    ///
+    /// Directory will be created if it does not exist.
+    ///
+    /// Defaults to '.' when omitted.
+    #[arg(
+        long,
+        value_name = amaru::value_names::DIRECTORY,
+        env = amaru::env_vars::TARGET_DIR,
+        default_value = ".",
+    )]
+    target_dir: PathBuf,
 }
 
 #[derive(Debug, PartialEq, thiserror::Error)]
@@ -61,13 +68,16 @@ pub enum Error {
 }
 
 pub(crate) async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
-    let target_dir = args.target_dir.unwrap_or(PathBuf::from("."));
-
-    info!(network = %args.network, target_dir=%target_dir.to_string_lossy(), snapshot=%args.snapshot.to_string_lossy(),
-          "Running command convert-ledger-state",
+    info!(
+        _command = "convert-ledger-state",
+        network = %args.network,
+        snapshot = %args.snapshot.to_string_lossy(),
+        target_dir = %args.target_dir.to_string_lossy(),
+        "running"
     );
 
-    convert_one_snapshot_file(&target_dir, &args.snapshot, &args.network).await?;
+    convert_one_snapshot_file(&args.target_dir, &args.snapshot, &args.network).await?;
+
     Ok(())
 }
 
@@ -86,10 +96,7 @@ async fn convert_one_snapshot_file(
     fs::create_dir_all(target_dir).await?;
 
     let converted = convert_snapshot_to(snapshot, target_dir, network).await?;
-    info!(
-        "converted ledger state from {:?} to {:?}",
-        snapshot, converted
-    );
+    info!("converted ledger state from {:?} to {:?}", snapshot, converted);
     Ok(converted)
 }
 
@@ -117,19 +124,20 @@ async fn convert_snapshot_to(
     // HardForkCombinator telescope encoding.
     // encodes the era history. There are 6 eras before conway.
     // FIXME: pass the current Era to know how many skips to do
-    let mut eras: Vec<Summary> = decode_eras(&mut d, network)?;
+    let mut eras: Vec<EraSummary> = decode_eras(&mut d, network)?;
 
     // current era lower bound
     d.array()?;
-    let start: Bound = d.decode()?;
-    eras.push(Summary {
+    let start: EraBound = d.decode()?;
+    eras.push(EraSummary {
         start,
         end: None,
         // FIXME: the current era params should be extracted from teh
         // protocol parameters which are decoded later down the road.
         params: EraParams {
             epoch_size_slots: network.default_epoch_size_in_slots(),
-            slot_length: 1000,
+            slot_length: Duration::from_secs(1),
+            era_name: EraName::Conway,
         },
     });
 
@@ -232,7 +240,7 @@ async fn convert_snapshot_to(
     d.skip()?;
 
     let nonces = InitialNonces {
-        at: Point::Specific(tip_slot, tip_hash.to_vec()),
+        at: Point::Specific(tip_slot.into(), tip_hash),
         active,
         evolving,
         candidate,
@@ -258,30 +266,32 @@ async fn write_era_history(
 
 /// This is the number of past eras before the current era in the "standard" Cardano history, e.g
 /// from Byron to Babbage. Bump this number when a hard fork happens.
-pub const PAST_ERAS_NUMBER: i32 = 6;
+pub const PAST_ERAS_NUMBER: u8 = 6;
 
 fn decode_eras(
     d: &mut minicbor::Decoder<'_>,
     network: &NetworkName,
-) -> Result<Vec<Summary>, Box<dyn std::error::Error>> {
+) -> Result<Vec<EraSummary>, Box<dyn std::error::Error>> {
     let mut eras = Vec::new();
 
-    for _ in 0..PAST_ERAS_NUMBER {
+    for era_tag in 1..=PAST_ERAS_NUMBER {
         d.array()?;
-        let start: Bound = d.decode()?;
-        let end: Bound = d.decode()?;
+        let start: EraBound = d.decode()?;
+        let end: EraBound = d.decode()?;
         let params = if end.slot == 0.into() {
+            #[expect(clippy::expect_used)]
             EraParams {
                 epoch_size_slots: network.default_epoch_size_in_slots(),
-                slot_length: 0,
+                slot_length: Duration::from_secs(0),
+                era_name: EraName::try_from(era_tag).expect("iteration over known era tags"),
             }
         } else {
             let end_slot = u64::from(end.slot);
             let start_slot = u64::from(start.slot);
             let end_epoch = u64::from(end.epoch);
             let start_epoch = u64::from(start.epoch);
-            let end_ms = u64::from(end.time_ms);
-            let start_ms = u64::from(start.time_ms);
+            let end_ms = end.time.as_millis() as u64;
+            let start_ms = start.time.as_millis() as u64;
 
             if end_slot <= start_slot || end_epoch <= start_epoch {
                 return Err("Invalid era bounds (non-increasing)".into());
@@ -290,20 +300,17 @@ fn decode_eras(
             let epochs_elapsed = end_epoch - start_epoch;
             let time_ms_elapsed = end_ms.saturating_sub(start_ms);
 
+            // end_slot > start_slot => slots_elapsed > 0
+            let slot_length = Duration::from_millis(time_ms_elapsed / slots_elapsed);
+
+            #[expect(clippy::expect_used)]
             EraParams {
                 epoch_size_slots: slots_elapsed / epochs_elapsed,
-                slot_length: if slots_elapsed == 0 {
-                    0
-                } else {
-                    time_ms_elapsed / slots_elapsed
-                },
+                slot_length,
+                era_name: EraName::try_from(era_tag).expect("iteration over known era tags"),
             }
         };
-        let summary = Summary {
-            start,
-            end: Some(end),
-            params,
-        };
+        let summary = EraSummary { start, end: Some(end), params };
         eras.push(summary);
     }
     Ok(eras)
@@ -335,20 +342,20 @@ async fn write_ledger_snapshot(
 
 #[cfg(test)]
 mod test {
-    use super::*;
-    use crate::cmd::import_ledger_state::import_all;
-    use amaru_kernel::network::NetworkName;
     use std::path::PathBuf;
+
+    use amaru::bootstrap::import_snapshots;
+    use amaru_kernel::NetworkName;
     use tokio::fs;
+
+    use super::*;
 
     #[tokio::test]
     async fn fails_if_file_does_not_exist() {
         let tempdir = tempfile::tempdir().unwrap();
         let snapshot_path = PathBuf::from("does-not-exist");
 
-        let result =
-            convert_one_snapshot_file(tempdir.path(), &snapshot_path, &NetworkName::Testnet(42))
-                .await;
+        let result = convert_one_snapshot_file(tempdir.path(), &snapshot_path, &NetworkName::Testnet(42)).await;
 
         assert!(result.is_err());
     }
@@ -358,48 +365,30 @@ mod test {
         let network = NetworkName::Testnet(42);
         let tempdir = tempfile::tempdir().unwrap();
         let expected_paths = vec![
-            tempdir.path().join(
-                "86392.1d38de4ffae6090c24151578d331b1021adb8f37d158011616db4d47d1704968.cbor",
-            ),
-            tempdir.path().join(
-                "172786.932b9688167139cf4792e97ae4771b6dc762ad25752908cce7b24c2917847516.cbor",
-            ),
-            tempdir.path().join(
-                "259174.a07da7616822a1ccb4811e907b1f3a3c5274365908a241f4d5ffab2a69eb8802.cbor",
-            ),
+            tempdir.path().join("86392.1d38de4ffae6090c24151578d331b1021adb8f37d158011616db4d47d1704968.cbor"),
+            tempdir.path().join("172786.932b9688167139cf4792e97ae4771b6dc762ad25752908cce7b24c2917847516.cbor"),
+            tempdir.path().join("259174.a07da7616822a1ccb4811e907b1f3a3c5274365908a241f4d5ffab2a69eb8802.cbor"),
         ];
 
         let snapshots = dir_content(Path::new("tests/data/convert")).await.unwrap();
 
         for snapshot in snapshots {
-            let args = super::Args {
-                snapshot,
-                target_dir: Some(tempdir.path().to_path_buf()),
-                network,
-            };
+            let args = super::Args { snapshot, target_dir: tempdir.path().to_path_buf(), network };
 
-            run(args)
-                .await
-                .expect("unexpected error in conversion test");
+            run(args).await.expect("unexpected error in conversion test");
         }
 
         assert!(
             expected_paths.iter().all(|p| p.exists()),
             "missing converted snapshots in {:?}",
-            dir_content(tempdir.path())
-                .await
-                .unwrap_or_else(|_| panic!("failed to list {tempdir:?} content"))
+            dir_content(tempdir.path()).await.unwrap_or_else(|_| panic!("failed to list {tempdir:?} content"))
         );
 
         assert_import_ledger_db(&expected_paths, &tempdir.path().join("ledger.db"), network).await;
     }
 
-    async fn assert_import_ledger_db(
-        expected_paths: &Vec<PathBuf>,
-        ledger_dir: &PathBuf,
-        network: NetworkName,
-    ) {
-        import_all(network, expected_paths, ledger_dir)
+    async fn assert_import_ledger_db(expected_paths: &Vec<PathBuf>, ledger_dir: &PathBuf, network: NetworkName) {
+        import_snapshots(network, expected_paths, ledger_dir)
             .await
             .unwrap_or_else(|e| panic!("fail to import snapshots: {e}\n{expected_paths:?}"));
     }
@@ -410,37 +399,23 @@ mod test {
         let tempdir = tempfile::tempdir().unwrap();
         let target_dir = tempdir.path().to_path_buf();
         let expected_paths = [
-            tempdir.path().join(
-                "nonces.86392.1d38de4ffae6090c24151578d331b1021adb8f37d158011616db4d47d1704968.json",
-            ),
-            tempdir.path().join(
-                "nonces.172786.932b9688167139cf4792e97ae4771b6dc762ad25752908cce7b24c2917847516.json",
-            ),
-            tempdir.path().join(
-                "nonces.259174.a07da7616822a1ccb4811e907b1f3a3c5274365908a241f4d5ffab2a69eb8802.json",
-            ),
+            tempdir.path().join("nonces.86392.1d38de4ffae6090c24151578d331b1021adb8f37d158011616db4d47d1704968.json"),
+            tempdir.path().join("nonces.172786.932b9688167139cf4792e97ae4771b6dc762ad25752908cce7b24c2917847516.json"),
+            tempdir.path().join("nonces.259174.a07da7616822a1ccb4811e907b1f3a3c5274365908a241f4d5ffab2a69eb8802.json"),
         ];
 
         let snapshots = dir_content(Path::new("tests/data/convert")).await.unwrap();
 
         for snapshot in snapshots {
-            let args = super::Args {
-                snapshot,
-                target_dir: Some(target_dir.clone()),
-                network,
-            };
+            let args = super::Args { snapshot, target_dir: target_dir.clone(), network };
 
-            run(args)
-                .await
-                .expect("unexpected error in conversion test");
+            run(args).await.expect("unexpected error in conversion test");
         }
 
         assert!(
             expected_paths.iter().all(|p| p.exists()),
             "tempdir content {:?}",
-            dir_content(tempdir.path())
-                .await
-                .unwrap_or_else(|_| panic!("failed to list {tempdir:?} content"))
+            dir_content(tempdir.path()).await.unwrap_or_else(|_| panic!("failed to list {tempdir:?} content"))
         );
     }
 

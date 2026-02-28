@@ -12,14 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::fmt::{Display, Formatter};
 use std::{
+    cell::RefCell,
+    fmt::{Display, Formatter},
     sync::{
         LazyLock,
         atomic::{AtomicU64, Ordering},
     },
     time::Duration,
 };
+
+use parking_lot::Mutex;
+
+use crate::drop_guard::DropGuard;
 
 /// A simulation clock that is driven explicitly by the simulation.
 pub trait Clock {
@@ -39,38 +44,56 @@ impl Clock for AtomicU64 {
 
     fn advance_to(&self, instant: Instant) {
         let nanos = instant.saturating_since(*EPOCH).as_nanos();
-        assert!(
-            nanos < u64::MAX as u128,
-            "simulation is not supposed to run for more than 584 years"
-        );
+        assert!(nanos < u64::MAX as u128, "simulation is not supposed to run for more than 584 years");
         let nanos = nanos as u64;
         let old = self.swap(nanos, Ordering::Relaxed);
         assert!(old <= nanos, "clock is not monotonic");
     }
 }
 
+impl Clock for Mutex<Instant> {
+    fn now(&self) -> Instant {
+        *self.lock()
+    }
+
+    fn advance_to(&self, instant: Instant) {
+        *self.lock() = instant;
+    }
+}
+
 /// A point in time in the simulation.
 ///
 /// Note that this is an opaque type that serialises and prints as a duration since the [`EPOCH`].
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Eq, PartialOrd, Ord)]
 pub struct Instant(tokio::time::Instant);
+
+thread_local! {
+    static TOLERANCE: RefCell<Duration> = const { RefCell::new(Duration::from_nanos(0)) };
+}
+
+impl PartialEq for Instant {
+    fn eq(&self, other: &Self) -> bool {
+        let tolerance = TOLERANCE.with(|tolerance| *tolerance.borrow());
+        if tolerance.is_zero() {
+            self.0 == other.0
+        } else if self > other {
+            self.0 - other.0 <= tolerance
+        } else {
+            other.0 - self.0 <= tolerance
+        }
+    }
+}
 
 impl std::fmt::Debug for Instant {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("Instant")
-            .field(&self.saturating_since(*EPOCH))
-            .finish()
+        f.debug_tuple("Instant").field(&self.saturating_since(*EPOCH)).finish()
     }
 }
 
 impl Display for Instant {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         let duration = self.saturating_since(*EPOCH);
-        if duration.as_secs() == 0 {
-            write!(f, "{:?}", duration)
-        } else {
-            write!(f, "{:.3?}", duration)
-        }
+        write!(f, "{:.6?}", duration)
     }
 }
 
@@ -95,8 +118,19 @@ impl serde::Serialize for Instant {
 }
 
 impl Instant {
+    pub fn with_tolerance_for_test(tolerance: Duration) -> DropGuard<Duration, fn(Duration)> {
+        fn restore(tolerance: Duration) {
+            TOLERANCE.with_borrow_mut(|t2| *t2 = tolerance)
+        }
+        TOLERANCE.with_borrow_mut(|t| DropGuard::new(std::mem::replace(t, tolerance), restore as fn(Duration)))
+    }
+
     pub(crate) fn from_tokio(instant: tokio::time::Instant) -> Self {
         Self(instant)
+    }
+
+    pub(crate) fn to_tokio(self) -> tokio::time::Instant {
+        self.0
     }
 
     pub(crate) fn now() -> Self {
@@ -132,9 +166,7 @@ impl std::ops::Add<Duration> for Instant {
     #[expect(clippy::expect_used)]
     fn add(self, duration: Duration) -> Self {
         Instant(
-            self.0
-                .checked_add(duration)
-                .expect("simulation is not supposed to run for more than 290 billion years"),
+            self.0.checked_add(duration).expect("simulation is not supposed to run for more than 290 billion years"),
         )
     }
 }
@@ -145,9 +177,7 @@ impl std::ops::Sub<Duration> for Instant {
     #[expect(clippy::expect_used)]
     fn sub(self, duration: Duration) -> Self {
         Instant(
-            self.0
-                .checked_sub(duration)
-                .expect("simulation is not supposed to run for more than 290 billion years"),
+            self.0.checked_sub(duration).expect("simulation is not supposed to run for more than 290 billion years"),
         )
     }
 }

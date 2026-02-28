@@ -14,28 +14,39 @@
 
 #[cfg(any(test, feature = "test-utils"))]
 pub mod tests {
+    use std::{collections::BTreeMap, env, fs, io::Write as _, path::Path};
+
     use amaru_kernel::{
-        AnyCbor, AuxiliaryData, Bytes, Epoch, EraHistory, Hasher, KeepRaw, MintedTransactionBody,
-        MintedTx, MintedWitnessSet, Network, TransactionPointer, cbor, network::NetworkName,
-        protocol_parameters::ProtocolParameters,
+        Bytes, Epoch, EraHistory, NetworkName, ProtocolParameters, Transaction, TransactionPointer, WitnessSet, cbor,
+        cbor as minicbor,
     };
-    use amaru_ledger::{
-        self, context::DefaultValidationContext, rules::transaction, store::GovernanceActivity,
-    };
-    use std::{collections::BTreeMap, env, fs, ops::Deref, path::Path};
+    use amaru_ledger::{self, context::DefaultValidationContext, rules::transaction, store::GovernanceActivity};
 
     // Tests cases are constructed in build.rs, which generates the test_cases.rs file
     include!(concat!(env!("OUT_DIR"), "/test_cases.rs"));
 
     fn import_and_evaluate_vector(
+        test_data_dir: &Path,
         snapshot: &str,
         pparams_dir: &str,
+        expected_result: Result<(), &str>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let network = NetworkName::Testnet(1);
         let era_history = network.into();
-        let vector_file = fs::read(snapshot)?;
+        let vector_file = fs::read(test_data_dir.join(snapshot))?;
         let record: TestVector = cbor::decode(&vector_file)?;
-        evaluate_vector(record, era_history, Path::new(pparams_dir))?;
+
+        let actual = evaluate_vector(record, era_history, &test_data_dir.join(pparams_dir)).map_err(|e| e.to_string());
+        if let Some(path) = std::env::var_os("AMARU_UPDATE_LEDGER_CONFORMANCE_SNAPSHOT_PATH") {
+            // Append to the (toml format) snapshot file that tracks which tests are expected to fail.
+            if let Err(error) = actual {
+                let mut file = fs::OpenOptions::new().append(true).open(path)?;
+                writeln!(&mut file, "{} = {}", toml::Value::String(snapshot.to_string()), toml::Value::String(error),)?;
+            }
+        } else {
+            let expected = expected_result.map_err(|e| e.to_string());
+            assert_eq!(expected, actual, "The results of a conformance test have changed.");
+        }
         Ok(())
     }
 
@@ -43,11 +54,11 @@ pub mod tests {
     #[allow(dead_code)]
     struct TestVector {
         #[n(0)]
-        config: AnyCbor,
+        config: cbor::Any,
         #[n(1)]
-        initial_state: AnyCbor,
+        initial_state: cbor::Any,
         #[n(2)]
-        final_state: AnyCbor,
+        final_state: cbor::Any,
         #[n(3)]
         events: Vec<TestVectorEvent>,
         #[n(4)]
@@ -68,16 +79,10 @@ pub mod tests {
             let variant = d.u16()?;
 
             match variant {
-                0 => Ok(TestVectorEvent::Transaction(
-                    d.decode_with(ctx)?,
-                    d.decode_with(ctx)?,
-                    d.decode_with(ctx)?,
-                )),
+                0 => Ok(TestVectorEvent::Transaction(d.decode_with(ctx)?, d.decode_with(ctx)?, d.decode_with(ctx)?)),
                 1 => Ok(TestVectorEvent::PassTick(d.decode_with(ctx)?)),
                 2 => Ok(TestVectorEvent::PassEpoch(d.decode_with(ctx)?)),
-                _ => Err(cbor::decode::Error::message(
-                    "invalid variant id for TestVectorEvent",
-                )),
+                _ => Err(cbor::decode::Error::message("invalid variant id for TestVectorEvent")),
             }
         }
     }
@@ -87,14 +92,7 @@ pub mod tests {
     // about the utxos.
     fn decode_ledger_state<'b>(
         d: &mut cbor::Decoder<'b>,
-    ) -> Result<
-        (
-            DefaultValidationContext,
-            &'b cbor::bytes::ByteSlice,
-            GovernanceActivity,
-        ),
-        cbor::decode::Error,
-    > {
+    ) -> Result<(DefaultValidationContext, &'b cbor::bytes::ByteSlice, GovernanceActivity), cbor::decode::Error> {
         let _begin_nes = d.array()?;
         let _epoch_no = d.u64()?;
         d.skip()?; // blocks_made
@@ -154,9 +152,7 @@ pub mod tests {
         Ok((
             DefaultValidationContext::new(utxos_map),
             current_pparams_hash,
-            GovernanceActivity {
-                consecutive_dormant_epochs: u64::from(number_of_dormant_epochs) as u32,
-            },
+            GovernanceActivity { consecutive_dormant_epochs: u64::from(number_of_dormant_epochs) as u32 },
         ))
     }
 
@@ -167,9 +163,7 @@ pub mod tests {
         let pparams_file_path = fs::read_dir(dir)?
             .filter_map(|entry| entry.ok().map(|e| e.path()))
             .find(|path| {
-                path.file_name()
-                    .map(|filename| filename.to_str() == Some(&hex::encode(hash.as_ref())))
-                    .unwrap_or(false)
+                path.file_name().map(|filename| filename.to_str() == Some(&hex::encode(hash.as_ref()))).unwrap_or(false)
             })
             .ok_or("Missing pparams file")?;
 
@@ -186,8 +180,7 @@ pub mod tests {
         pparams_dir: &Path,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let mut decoder = cbor::Decoder::new(&record.initial_state);
-        let (mut validation_context, pparams_hash, governance_activity) =
-            decode_ledger_state(&mut decoder)?;
+        let (mut validation_context, pparams_hash, governance_activity) = decode_ledger_state(&mut decoder)?;
 
         let protocol_parameters = decode_segregated_parameters(pparams_dir, pparams_hash)?;
 
@@ -196,13 +189,11 @@ pub mod tests {
                 TestVectorEvent::Transaction(tx, success, slot) => (tx, success, slot),
                 TestVectorEvent::PassTick(..) | TestVectorEvent::PassEpoch(..) => continue,
             };
-            let tx: MintedTx<'_> = cbor::decode(tx_bytes.as_slice())?;
+            let tx: Transaction = cbor::decode(tx_bytes.as_slice())?;
 
-            let tx_body: KeepRaw<'_, MintedTransactionBody<'_>> = tx.transaction_body.clone();
-            let tx_witness_set: MintedWitnessSet<'_> = tx.transaction_witness_set.deref().clone();
-            let tx_auxiliary_data =
-                Into::<Option<KeepRaw<'_, AuxiliaryData>>>::into(tx.auxiliary_data.clone())
-                    .map(|aux_data| Hasher::<256>::hash(aux_data.raw_cbor()));
+            let tx_witness_set: WitnessSet = tx.witnesses.clone();
+
+            let tx_auxiliary_data = tx.auxiliary_data.as_ref();
 
             let pointer = TransactionPointer {
                 slot: slot.into(),
@@ -212,21 +203,21 @@ pub mod tests {
             };
 
             // Run the transaction against the imported ledger state
-            let result = transaction::execute(
+            let result = transaction::phase_one::execute(
                 &mut validation_context,
-                &Network::Testnet,
+                &NetworkName::Preprod,
                 &protocol_parameters,
                 era_history,
                 &governance_activity,
                 pointer,
                 true,
-                tx_body,
+                tx.body,
                 &tx_witness_set,
                 tx_auxiliary_data,
             );
 
             match result {
-                Ok(()) if !success => return Err("Expected failure, got success".into()),
+                Ok(_) if !success => return Err("Expected failure, got success".into()),
                 Err(e) if success => {
                     return Err(format!("Expected success, got failure: {}", e).into());
                 }

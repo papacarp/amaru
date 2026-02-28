@@ -12,20 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{
-    constr,
-    script_context::{
-        CurrencySymbol, DatumOption, RequiredSigners, Script, StakeAddress, TimeRange,
-    },
-};
+use std::{borrow::Cow, collections::BTreeMap, time::SystemTime};
+
 use amaru_kernel::{
-    Address, BigInt, Bytes, ComputeHash, Hash, Int, KeyValuePairs, MaybeIndefArray, MemoizedDatum,
-    NonEmptyKeyValuePairs, NonZeroInt, Nullable, PlutusData, Redeemer, ShelleyDelegationPart,
-    ShelleyPaymentPart, StakeCredential, StakePayload,
+    Address, BigInt, Bytes, ComputeHash, Hash, Int, MaybeIndefArray, MemoizedDatum, NonEmptyKeyValuePairs, NonZeroInt,
+    Nullable, PlutusData, Redeemer, ShelleyDelegationPart, ShelleyPaymentPart, StakeCredential,
 };
 use thiserror::Error;
 
-use std::{borrow::Cow, collections::BTreeMap};
+use crate::{
+    constr,
+    script_context::{CurrencySymbol, DatumOption, RequiredSigners, Script, TimeRange},
+};
 
 /// Represents an error that occured during serialization to `PlutusData`.
 #[derive(Debug, Error)]
@@ -39,10 +37,7 @@ pub enum PlutusDataError {
 
 impl PlutusDataError {
     pub fn unsupported_version(message: impl Into<String>, version: u8) -> Self {
-        Self::UnsupportedVersion {
-            message: message.into(),
-            version,
-        }
+        Self::UnsupportedVersion { message: message.into(), version }
     }
 }
 
@@ -118,6 +113,7 @@ where
 impl<const V: u8> ToPlutusData<V> for Address
 where
     PlutusVersion<V>: IsKnownPlutusVersion,
+    amaru_kernel::StakeAddress: ToPlutusData<V>,
 {
     /// In all Plutus v1 and v2 and v3 encodings, Byron addresses are not possible encodings.
     ///
@@ -141,27 +137,30 @@ where
 
                 let stake_part_plutus_data = match stake_part {
                     ShelleyDelegationPart::Key(stake_keyhash) => {
-                        Some(constr!(0, [StakeCredential::AddrKeyhash(*stake_keyhash)])?)
-                            .to_plutus_data()
+                        Some(constr!(0, [StakeCredential::AddrKeyhash(*stake_keyhash)])?).to_plutus_data()
                     }
                     ShelleyDelegationPart::Script(script_hash) => {
-                        Some(constr!(0, [StakeCredential::ScriptHash(*script_hash)])?)
-                            .to_plutus_data()
+                        Some(constr!(0, [StakeCredential::ScriptHash(*script_hash)])?).to_plutus_data()
                     }
-                    ShelleyDelegationPart::Pointer(pointer) => Some(constr!(
-                        1,
-                        [pointer.slot(), pointer.tx_idx(), pointer.cert_idx()]
-                    )?)
-                    .to_plutus_data(),
+                    ShelleyDelegationPart::Pointer(pointer) => {
+                        Some(constr!(1, [pointer.slot(), pointer.tx_idx(), pointer.cert_idx()])?).to_plutus_data()
+                    }
                     ShelleyDelegationPart::Null => None::<StakeCredential>.to_plutus_data(),
                 }?;
 
                 constr!(0, [payment_part_plutus_data, stake_part_plutus_data])
             }
-            Address::Stake(stake_address) => stake_address.to_plutus_data(),
+            Address::Stake(stake_address) => {
+                <amaru_kernel::StakeAddress as ToPlutusData<V>>::to_plutus_data(stake_address)
+            }
             Address::Byron(_) => unreachable!("unable to encode Byron address in PlutusData"),
         }
     }
+}
+
+#[allow(clippy::expect_used)]
+fn system_time_to_posix_millis(st: SystemTime) -> u64 {
+    st.duration_since(SystemTime::UNIX_EPOCH).expect("system time before Unix epoch?").as_millis() as u64
 }
 
 impl<const V: u8> ToPlutusData<V> for TimeRange
@@ -170,36 +169,15 @@ where
 {
     fn to_plutus_data(&self) -> Result<PlutusData, PlutusDataError> {
         let lower = match self.lower_bound {
-            Some(x) => constr!(0, [constr!(1, [u64::from(x)])?, true]),
+            Some(x) => constr!(0, [constr!(1, [system_time_to_posix_millis(x)])?, true]),
             None => constr!(0, [constr!(0)?, true]),
         };
         let upper = match self.upper_bound {
-            Some(x) => constr!(0, [constr!(1, [u64::from(x)])?, false]),
+            Some(x) => constr!(0, [constr!(1, [system_time_to_posix_millis(x)])?, false]),
             None => constr!(0, [constr!(2)?, true]),
         };
 
         constr!(0, [lower?, upper?])
-    }
-}
-
-impl<const V: u8> ToPlutusData<V> for amaru_kernel::StakeAddress
-where
-    PlutusVersion<V>: IsKnownPlutusVersion,
-{
-    fn to_plutus_data(&self) -> Result<PlutusData, PlutusDataError> {
-        match self.payload() {
-            StakePayload::Stake(keyhash) => constr!(0, [keyhash]),
-            StakePayload::Script(script_hash) => constr!(1, [script_hash]),
-        }
-    }
-}
-
-impl<const V: u8> ToPlutusData<V> for StakeAddress
-where
-    PlutusVersion<V>: IsKnownPlutusVersion,
-{
-    fn to_plutus_data(&self) -> Result<PlutusData, PlutusDataError> {
-        amaru_kernel::StakeAddress::from(self.clone()).to_plutus_data()
     }
 }
 
@@ -310,9 +288,7 @@ where
     #[allow(clippy::unwrap_used)]
     fn to_plutus_data(&self) -> Result<PlutusData, PlutusDataError> {
         // Unwrap is safe here, u64 cannot possible be too big for the `Int` structure
-        Ok(PlutusData::BigInt(BigInt::Int(
-            Int::try_from(*self as i128).unwrap(),
-        )))
+        Ok(PlutusData::BigInt(BigInt::Int(Int::try_from(*self as i128).unwrap())))
     }
 }
 
@@ -323,9 +299,7 @@ where
     #[allow(clippy::unwrap_used)]
     fn to_plutus_data(&self) -> Result<PlutusData, PlutusDataError> {
         // Unwrap is safe here, usize cannot possible be too big for the `Int` structure
-        Ok(PlutusData::BigInt(BigInt::Int(
-            Int::try_from(*self as i128).unwrap(),
-        )))
+        Ok(PlutusData::BigInt(BigInt::Int(Int::try_from(*self as i128).unwrap())))
     }
 }
 
@@ -339,9 +313,7 @@ where
             Ok(PlutusData::Array(MaybeIndefArray::Def(vec![])))
         } else {
             Ok(PlutusData::Array(MaybeIndefArray::Indef(
-                self.iter()
-                    .map(|a| a.to_plutus_data())
-                    .collect::<Result<_, _>>()?,
+                self.iter().map(|a| a.to_plutus_data()).collect::<Result<_, _>>()?,
             )))
         }
     }
@@ -364,21 +336,19 @@ where
 {
     fn to_plutus_data(&self) -> Result<PlutusData, PlutusDataError> {
         Ok(PlutusData::Map(
-            self.iter()
-                .map(|(k, v)| Ok((k.to_plutus_data()?, v.to_plutus_data()?)))
-                .collect::<Result<_, _>>()?,
+            self.iter().map(|(k, v)| Ok((k.to_plutus_data()?, v.to_plutus_data()?))).collect::<Result<_, _>>()?,
         ))
     }
 }
 
-impl<const VER: u8, K, V> ToPlutusData<VER> for KeyValuePairs<K, V>
+impl<const VER: u8, K, V> ToPlutusData<VER> for pallas_codec::utils::KeyValuePairs<K, V>
 where
     PlutusVersion<VER>: IsKnownPlutusVersion,
     K: ToPlutusData<VER> + Clone,
     V: ToPlutusData<VER> + Clone,
 {
     fn to_plutus_data(&self) -> Result<PlutusData, PlutusDataError> {
-        Ok(PlutusData::Map(KeyValuePairs::Def(
+        Ok(PlutusData::Map(pallas_codec::utils::KeyValuePairs::Def(
             self.iter()
                 .map(|(key, value)| Ok((key.to_plutus_data()?, value.to_plutus_data()?)))
                 .collect::<Result<Vec<_>, _>>()?,
@@ -389,13 +359,13 @@ where
 impl<const VER: u8, K, V> ToPlutusData<VER> for NonEmptyKeyValuePairs<K, V>
 where
     PlutusVersion<VER>: IsKnownPlutusVersion,
-    K: ToPlutusData<VER> + Clone,
+    K: ToPlutusData<VER> + Clone + Eq,
     V: ToPlutusData<VER> + Clone,
 {
     fn to_plutus_data(&self) -> Result<PlutusData, PlutusDataError> {
-        Ok(PlutusData::Map(KeyValuePairs::Def(
+        Ok(PlutusData::Map(pallas_codec::utils::KeyValuePairs::Def(
             self.iter()
-                .map(|(key, value)| Ok((key.to_plutus_data()?, value.to_plutus_data()?)))
+                .map(|(key, value): &(K, V)| Ok((key.to_plutus_data()?, value.to_plutus_data()?)))
                 .collect::<Result<Vec<_>, _>>()?,
         )))
     }

@@ -1,0 +1,108 @@
+// Copyright 2025 PRAGMA
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use amaru_kernel::{
+    Hash, MemoizedDatum, Nullable, Proposal, ProposalId, ProposalPointer, RequiredScript, ScriptPurpose, TransactionId,
+    TransactionPointer, size::SCRIPT,
+};
+
+use crate::context::{ProposalsSlice, WitnessSlice};
+
+pub(crate) fn execute<C>(
+    context: &mut C,
+    transaction: (TransactionId, TransactionPointer),
+    proposals: Option<Vec<Proposal>>,
+) where
+    C: ProposalsSlice + WitnessSlice,
+{
+    for (proposal_index, proposal) in proposals.unwrap_or_default().into_iter().enumerate() {
+        if let Some(script_hash) = get_proposal_script_hash(&proposal) {
+            context.require_script_witness(RequiredScript {
+                hash: script_hash,
+                index: proposal_index as u32,
+                purpose: ScriptPurpose::Propose,
+                datum: MemoizedDatum::None,
+            });
+        }
+
+        let pointer = ProposalPointer { transaction: transaction.1, proposal_index };
+        let id = ProposalId { transaction_id: transaction.0, action_index: proposal_index as u32 };
+        context.acknowledge(id, pointer, proposal)
+    }
+}
+
+fn get_proposal_script_hash(proposal: &Proposal) -> Option<Hash<SCRIPT>> {
+    use amaru_kernel::GovernanceAction::*;
+
+    match proposal.gov_action {
+        ParameterChange(_, _, Nullable::Some(gov_proposal_hash)) => Some(gov_proposal_hash),
+        TreasuryWithdrawals(_, Nullable::Some(gov_proposal_hash)) => Some(gov_proposal_hash),
+        ParameterChange(..)
+        | HardForkInitiation(..)
+        | TreasuryWithdrawals(..)
+        | NoConfidence(_)
+        | UpdateCommittee(..)
+        | NewConstitution(..)
+        | Information => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::mem;
+
+    use amaru_kernel::{Slot, TransactionBody, TransactionPointer, include_cbor, include_json, json};
+    use amaru_tracing_json::assert_trace;
+    use test_case::test_case;
+
+    use crate::{context::assert::AssertValidationContext, rules::tests::fixture_context};
+
+    macro_rules! fixture {
+        ($hash:literal, $pointer:expr) => {
+            (
+                fixture_context!($hash),
+                include_cbor!(concat!("transactions/preprod/", $hash, "/tx.cbor")),
+                $pointer,
+                include_json!(concat!("transactions/preprod/", $hash, "/expected.traces")),
+            )
+        };
+        ($hash:literal, $variant:literal, $pointer:expr) => {
+            (
+                fixture_context!($hash, $variant),
+                include_cbor!(concat!("transactions/preprod/", $hash, "/", $variant, "/tx.cbor")),
+                $pointer,
+                include_json!(concat!("transactions/preprod/", $hash, "/", $variant, "/expected.traces")),
+            )
+        };
+    }
+
+    #[test_case(fixture!("e974fecbf45ac386a76605e9e847a2e5d27c007fdd0be674cbad538e0c35fe01", TransactionPointer {
+        slot: Slot::from(74013957),
+        transaction_index: 0,
+    }); "happy path")]
+
+    fn test_proposals(
+        (mut ctx, mut tx, tx_pointer, expected_traces): (
+            AssertValidationContext,
+            TransactionBody,
+            TransactionPointer,
+            Vec<json::Value>,
+        ),
+    ) {
+        assert_trace(
+            || super::execute(&mut ctx, (tx.id(), tx_pointer), mem::take(&mut tx.proposals).map(|xs| xs.to_vec())),
+            expected_traces,
+        )
+    }
+}

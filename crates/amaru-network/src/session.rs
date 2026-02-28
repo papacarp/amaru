@@ -14,7 +14,7 @@
 
 use std::sync::Arc;
 
-use amaru_kernel::peer::Peer;
+use amaru_kernel::Peer;
 use pallas_network::facades::PeerClient;
 use tokio::sync::Mutex;
 
