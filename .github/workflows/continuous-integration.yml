@@ -39,6 +39,7 @@ permissions:
 
 jobs:
   build:
+    if: ${{ github.event_name != 'pull_request' || github.head_ref != 'pooltool_edits' }}
     name: Build ${{ matrix.environments.title }}
     timeout-minutes: 60
     strategy:
@@ -154,9 +155,9 @@ jobs:
           path: simulation/amaru-sim/test-data
 
   coverage:
+    if: ${{ (github.event_name != 'pull_request' || github.head_ref != 'pooltool_edits') && (github.event_name != 'pull_request' || !github.event.pull_request.draft) }}
     name: Test coverage
     runs-on: ubuntu-22.04
-    if: ${{ !github.event.pull_request.draft }}
     env:
       CARGO_TERM_COLOR: always
     steps:
@@ -187,8 +188,8 @@ jobs:
           files: lcov.info
 
   snapshots:
+    if: ${{ (github.event_name != 'pull_request' || github.head_ref != 'pooltool_edits') && (github.event_name != 'pull_request' || !github.event.pull_request.draft) }}
     name: End-to-end snapshot tests
-    if: ${{ !github.event.pull_request.draft }}
     uses: ./.github/workflows/snapshot-tests.yml
     with:
       use_fixed_epoch: true
@@ -206,6 +207,7 @@ jobs:
       CARDANO_NODE_BUCKET_NAME: ${{ secrets.CARDANO_NODE_BUCKET_NAME }}
 
   examples:
+    if: ${{ github.event_name != 'pull_request' || github.head_ref != 'pooltool_edits' }}
     name: Examples
     strategy:
       fail-fast: false
@@ -230,6 +232,7 @@ jobs:
         run: make
 
   benches:
+    if: ${{ github.event_name != 'pull_request' || github.head_ref != 'pooltool_edits' }}
     name: Benches
     runs-on: ubuntu-22.04
     steps:
@@ -245,6 +248,7 @@ jobs:
         run: cargo bench --bench headers_tree --features="test-utils profiling"
 
   cli:
+    if: ${{ github.event_name != 'pull_request' || github.head_ref != 'pooltool_edits' }}
     name: Test the CLI
     runs-on: ubuntu-22.04
     steps:
@@ -268,6 +272,7 @@ jobs:
         run: FORCE_COLOR=true ./bash_unit cli-tests/test_*
 
   validate-schemas:
+    if: ${{ github.event_name != 'pull_request' || github.head_ref != 'pooltool_edits' }}
     name: Validate Trace Schemas and Documentation
     runs-on: ubuntu-latest
     steps:

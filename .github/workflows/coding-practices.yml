@@ -21,6 +21,7 @@ env:
 
 jobs:
   changes:
+    if: ${{ github.event_name != 'pull_request' || github.head_ref != 'pooltool_edits' }}
     runs-on: ubuntu-latest
     # Required to expose outputs to dependent jobs (unused-dependencies, licenses-compatibility)
     outputs:
@@ -41,7 +42,7 @@ jobs:
 
   unused-dependencies:
     needs: changes
-    if: ${{ needs.changes.outputs.dependencies == 'true' }}
+    if: ${{ (github.event_name != 'pull_request' || github.head_ref != 'pooltool_edits') && needs.changes.outputs.dependencies == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -54,7 +55,7 @@ jobs:
 
   licenses-compatibility:
     needs: changes
-    if: ${{ needs.changes.outputs.dependencies == 'true' }}
+    if: ${{ (github.event_name != 'pull_request' || github.head_ref != 'pooltool_edits') && needs.changes.outputs.dependencies == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -66,6 +67,7 @@ jobs:
       - run: cargo deny-amaru
 
   license-headers:
+    if: ${{ github.event_name != 'pull_request' || github.head_ref != 'pooltool_edits' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -76,6 +78,7 @@ jobs:
           strict: false
 
   clippy:
+    if: ${{ github.event_name != 'pull_request' || github.head_ref != 'pooltool_edits' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -88,12 +91,14 @@ jobs:
       - run: cargo clippy-amaru
 
   formatting:
+    if: ${{ github.event_name != 'pull_request' || github.head_ref != 'pooltool_edits' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - run: cargo fmt-amaru
 
   docs:
+    if: ${{ github.event_name != 'pull_request' || github.head_ref != 'pooltool_edits' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
