@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::{
+    cell::Cell,
     collections::{BTreeMap, BTreeSet},
     fmt, fs,
     ops::Deref,
@@ -282,7 +283,11 @@ impl Store for RocksDB {
         }
         let transaction = self.db.transaction();
         self.ongoing_transaction.set(true);
-        RocksDBTransactionalContext { host: self, db: transaction }
+        RocksDBTransactionalContext {
+            host: self,
+            db: transaction,
+            _guard: RocksDBTransactionGuard { host: self, ended: Cell::new(false) },
+        }
     }
 }
 
@@ -519,19 +524,37 @@ impl_ReadStore!(for<'a> RocksDBTransactionalContext<'a>);
 // TransactionalContext
 // ----------------------------------------------------------------------------
 
+/// Ensures `transaction_ended()` is called when a transactional context is dropped without
+/// explicit commit/rollback (e.g. on error), so the next `create_transaction()` does not panic.
+struct RocksDBTransactionGuard<'a> {
+    host: &'a RocksDB,
+    ended: Cell<bool>,
+}
+
+impl Drop for RocksDBTransactionGuard<'_> {
+    fn drop(&mut self) {
+        if !self.ended.get() {
+            self.host.transaction_ended();
+        }
+    }
+}
+
 pub struct RocksDBTransactionalContext<'a> {
     host: &'a RocksDB,
     db: Transaction<'a, OptimisticTransactionDB>,
+    _guard: RocksDBTransactionGuard<'a>,
 }
 
 impl TransactionalContext<'_> for RocksDBTransactionalContext<'_> {
     fn commit(self) -> Result<(), StoreError> {
+        self._guard.ended.set(true);
         let res = self.db.commit().map_err(|err| StoreError::Internal(err.into()));
         self.host.transaction_ended();
         res
     }
 
     fn rollback(mut self) -> Result<(), StoreError> {
+        self._guard.ended.set(true);
         let transaction = std::mem::replace(&mut self.db, self.host.db.transaction());
         let res = transaction.rollback().map_err(|err| StoreError::Internal(err.into()));
         self.host.transaction_ended();

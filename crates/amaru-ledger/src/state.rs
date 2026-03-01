@@ -15,7 +15,7 @@
 use std::{
     borrow::Cow,
     cmp::max,
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     ops::Deref,
     sync::{Arc, Mutex, MutexGuard},
 };
@@ -38,7 +38,7 @@ pub use volatile_db::VolatileState;
 use crate::{
     context,
     context::DefaultValidationContext,
-    governance::ratification::{self, RatificationContext},
+    governance::ratification::{self, parent_id_from_governance_action, RatificationContext},
     rules,
     rules::block::BlockValidation,
     state::{
@@ -379,6 +379,9 @@ impl<S: Store, HS: HistoricalStores> State<S, HS> {
         )?;
 
         let protocol_parameters = if should_begin_epoch {
+            let roots = db.proposals_roots()?;
+            let proposals = db.iter_proposals()?.collect::<Vec<_>>();
+            let proposals = sort_proposals_for_ratification(proposals, &roots);
             begin_epoch(
                 &batch,
                 next_epoch,
@@ -391,8 +394,8 @@ impl<S: Store, HS: HistoricalStores> State<S, HS> {
                 //
                 // FIXME: We shouldn't collect all proposals here, but provides iterators for the
                 // ratification step to go over them lazily.
-                db.iter_proposals()?.collect::<Vec<_>>(),
-                db.proposals_roots()?,
+                proposals,
+                roots,
                 &self.protocol_parameters,
             )
         } else {
@@ -877,6 +880,45 @@ pub fn tick_proposals<'store>(
     refund_many(db, refunds.into_iter())?;
 
     Ok(ctx.protocol_parameters)
+}
+
+/// Sort proposals so that a proposal's parent (if in the list) appears before it.
+/// This satisfies the forest's insertion order requirement and avoids "unknown parent" errors
+/// when the parent is in the same batch. Proposals whose parent is not in the list or in roots
+/// are placed at the end (they will be skipped during drain with a warning).
+fn sort_proposals_for_ratification(
+    mut proposals: Vec<(ComparableProposalId, proposals::Row)>,
+    roots: &ProposalsRoots,
+) -> Vec<(ComparableProposalId, proposals::Row)> {
+    let root_ids: BTreeSet<&ComparableProposalId> = [
+        roots.protocol_parameters.as_ref(),
+        roots.hard_fork.as_ref(),
+        roots.constitutional_committee.as_ref(),
+        roots.constitution.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+
+    let mut sorted = Vec::with_capacity(proposals.len());
+    while !proposals.is_empty() {
+        let (ready, rest): (Vec<_>, Vec<_>) = proposals
+            .into_iter()
+            .partition(|(_id, row)| {
+                let parent = parent_id_from_governance_action(&row.proposal.gov_action);
+                match &parent {
+                    None => true,
+                    Some(p) => root_ids.contains(p) || sorted.iter().any(|(sid, _)| sid == p),
+                }
+            });
+        if ready.is_empty() {
+            sorted.extend(rest);
+            break;
+        }
+        sorted.extend(ready);
+        proposals = rest;
+    }
+    sorted
 }
 
 #[observability_trace(INFO, amaru::ledger::state::RATIFICATION_CONTEXT_NEW)]

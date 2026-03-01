@@ -2,7 +2,7 @@
 //
 // Live stake tracking module that calculates stake by pool ID
 
-use amaru_kernel::{output_stake_credential, HasLovelace, Lovelace, PoolId, StakeCredential};
+use amaru_kernel::{HasLovelace, Lovelace, PoolId, StakeCredential};
 use amaru_ledger::store::{ReadStore, StoreError};
 use amaru_stores::rocksdb::{ReadOnlyRocksDB, RocksDbConfig};
 use std::collections::BTreeMap;
@@ -35,7 +35,7 @@ pub fn calculate_stake_by_pool(
     // This uses RocksDB's open_for_read_only which uses shared locks and should not
     // conflict with a running node, though data may be slightly inconsistent during sync
     let config = RocksDbConfig::new(store_path.clone());
-    let db = ReadOnlyRocksDB::new(config)
+    let db = ReadOnlyRocksDB::new(&config)
         .map_err(|e| {
             StoreError::Internal(format!(
                 "Failed to open read-only database connection. \
@@ -55,7 +55,7 @@ pub fn calculate_stake_by_pool(
     // Second pass: add UTxO values to existing accounts (or create new entries)
     let utxos = db.iter_utxos()?;
     for (_, output) in utxos {
-        if let Some(credential) = output_stake_credential(&output) {
+        if let Some(credential) = output.delegate() {
             let value = output.lovelace();
             *stake_by_credential.entry(credential).or_insert(0) += value;
         }
@@ -133,7 +133,7 @@ pub fn calculate_detailed_pool_data(
 
     // Open read-only connection to the store
     let config = RocksDbConfig::new(store_path.clone());
-    let db = ReadOnlyRocksDB::new(config)
+    let db = ReadOnlyRocksDB::new(&config)
         .map_err(|e| {
             StoreError::Internal(format!(
                 "Failed to open read-only database connection. \
@@ -151,7 +151,7 @@ pub fn calculate_detailed_pool_data(
     // Second pass: add UTxO values to existing accounts
     let utxos = db.iter_utxos()?;
     for (_, output) in utxos {
-        if let Some(credential) = output_stake_credential(&output) {
+        if let Some(credential) = output.delegate() {
             let value = output.lovelace();
             *stake_by_credential.entry(credential).or_insert(0) += value;
         }

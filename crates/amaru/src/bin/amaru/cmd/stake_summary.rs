@@ -4,14 +4,13 @@
 
 use amaru::live_stake_tracker::PoolStakeData;
 use amaru::live_stake_tracker;
-use amaru_kernel::network::NetworkName;
+use amaru::{default_ledger_dir, DEFAULT_NETWORK};
+use amaru_kernel::NetworkName;
 use amaru_ledger::summary::serde::encode_pool_id;
 use clap::Parser;
 use hex;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-
-use crate::cmd::default_ledger_dir;
 
 #[derive(Debug, Parser)]
 pub struct Args {
@@ -23,7 +22,7 @@ pub struct Args {
         long,
         value_name = "NETWORK",
         env = "AMARU_NETWORK",
-        default_value_t = super::DEFAULT_NETWORK,
+        default_value_t = DEFAULT_NETWORK,
     )]
     network: NetworkName,
 

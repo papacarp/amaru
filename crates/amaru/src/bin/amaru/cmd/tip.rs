@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::cmd::{default_chain_dir, DEFAULT_NETWORK};
-use amaru_consensus::ReadOnlyChainStore;
-use amaru_kernel::network::NetworkName;
-use amaru_kernel::{BlockHeader, EraHistory, IsHeader};
+use amaru::{default_chain_dir, DEFAULT_NETWORK};
+use amaru_ouroboros::ReadOnlyChainStore;
+use amaru_kernel::NetworkName;
+use amaru_kernel::{BlockHeader, EraHistory, IsHeader, Slot};
 use amaru_stores::rocksdb::RocksDbConfig;
 use amaru_stores::rocksdb::consensus::{ReadOnlyChainDB, RocksDBStore};
 use clap::Parser;
@@ -86,7 +86,8 @@ pub fn run(args: Args) -> Result<(), Box<dyn Error>> {
         }
     };
 
-    let db: ReadOnlyChainDB = RocksDBStore::open_for_readonly(RocksDbConfig::new(chain_dir.clone()))
+    let config = RocksDbConfig::new(chain_dir.clone());
+    let db: ReadOnlyChainDB = RocksDBStore::open_for_readonly(&config)
         .map_err(|e| format!(
             "Failed to open chain database at {}: {}\n\
             Hint: If you're running mainnet, use: amaru tip --network mainnet\n\
@@ -103,9 +104,9 @@ pub fn run(args: Args) -> Result<(), Box<dyn Error>> {
         .load_header(&tip_hash)
         .ok_or_else(|| format!("Failed to load tip header: {}", tip_hash))?;
 
-    // Get the slot from the header
-    let slot_u64 = tip_header.slot();
-    let slot = amaru_slot_arithmetic::Slot::from(slot_u64);
+    // Get the slot from the header (already a Slot)
+    let slot: Slot = tip_header.slot();
+    let slot_u64: u64 = slot.into();
 
     // Get the era history for the detected network and convert slot to epoch
     let era_history = (*Into::<&'static EraHistory>::into(detected_network)).clone();

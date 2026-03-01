@@ -100,6 +100,9 @@ impl ProposalsForest {
     /// Insert many proposals at once, consuming them.
     ///
     /// Pre-condition: all proposals MUST HAVE NOT expire (i.e. be valid until the current epoch).
+    /// Proposals should be in topological order (parent before child) so that a proposal's parent
+    /// is either a current root or already in the forest. Proposals with an unknown parent (not in
+    /// roots and not in the list) are skipped with a warning so that the node can make progress.
     pub fn drain(
         mut self,
         era_history: &'_ EraHistory,
@@ -107,18 +110,25 @@ impl ProposalsForest {
     ) -> Result<Self, ProposalsInsertError<ComparableProposalId>> {
         let current_epoch = self.current_epoch;
 
-        proposals.drain(..).try_fold::<_, _, Result<_, ProposalsInsertError<_>>>(&mut self, |forest, (id, row)| {
-            // There shouldn't be any invalid proposals left at this point.
+        for (id, row) in proposals.drain(..) {
             assert!(
                 row.valid_until + 1 >= current_epoch,
                 "proposal {id:?} is expired (ratification epoch = {current_epoch}) but was \
                         drained into the forest: {row:?}",
             );
 
-            forest.insert(era_history, id, row.proposed_in, row.proposal.gov_action)?;
-
-            Ok(forest)
-        })?;
+            if let Err(e) = self.insert(era_history, id, row.proposed_in, row.proposal.gov_action) {
+                if let ProposalsInsertError::UnknownParent { id: skip_id, parent } = &e {
+                    tracing::warn!(
+                        proposal = %skip_id,
+                        parent = ?parent,
+                        "skipping proposal with unknown parent during ratification; node will continue"
+                    );
+                } else {
+                    return Err(e);
+                }
+            }
+        }
 
         Ok(self)
     }
@@ -682,6 +692,21 @@ fn into_parent_id(nullable: Nullable<ProposalId>) -> Option<Rc<ComparableProposa
     match nullable {
         Nullable::Undefined | Nullable::Null => None,
         Nullable::Some(id) => Some(Rc::new(ComparableProposalId::from(id))),
+    }
+}
+
+/// Extract the parent proposal id from a governance action, if any.
+/// Used to topologically sort proposals so parents are inserted before children.
+pub fn parent_id_from_governance_action(action: &GovernanceAction) -> Option<ComparableProposalId> {
+    use amaru_kernel::GovernanceAction::*;
+    let id = match action {
+        ParameterChange(parent, ..) | HardForkInitiation(parent, ..) | UpdateCommittee(parent, ..)
+        | NoConfidence(parent) | NewConstitution(parent, ..) => parent,
+        TreasuryWithdrawals(..) | Information => return None,
+    };
+    match id {
+        Nullable::Some(pid) => Some(ComparableProposalId::from(pid.clone())),
+        Nullable::Undefined | Nullable::Null => None,
     }
 }
 
