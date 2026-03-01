@@ -67,3 +67,5 @@ STAKE_TRACKING_EXAMPLE.md
 run_amaru.txt
 stake.txt
 snapshot_file*
+# Cursor IDE
+.cursor/
