@@ -15,7 +15,7 @@
 use std::sync::LazyLock;
 
 use amaru::{
-    observability::{Color, ObservabilityHints, setup_observability},
+    observability::{Color, ObservabilityHints, setup_observability, setup_observability_with_loggers},
     panic::panic_handler,
 };
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
@@ -111,6 +111,9 @@ enum Command {
     /// Reset the ledger database to the beginning of a specific epoch
     ResetToEpoch(cmd::reset_to_epoch::Args),
 
+    /// Calculate and display current stake distribution by pool ID.
+    StakeSummary(cmd::stake_summary::Args),
+
     /// Run the node in all its glory.
     #[command(alias = "daemon")]
     Run(cmd::run::Args),
@@ -158,14 +161,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Skip observability setup for dump-traces-schema to avoid polluting stderr
     let skip_logging = matches!(args.command, Command::DumpTracesSchema(_));
 
+    let (rewards_file, snapshot_file) = match &args.command {
+        Command::Run(run_args) => (run_args.rewards_file.clone(), run_args.snapshot_file.clone()),
+        _ => (None, None),
+    };
+
     let (metrics, teardown) = if skip_logging {
         (None, Box::new(|| Ok(())) as Box<dyn FnOnce() -> Result<(), Box<dyn std::error::Error>>>)
     } else {
-        let (m, t) = setup_observability(
+        let (m, t) = setup_observability_with_loggers(
             args.with_open_telemetry,
             args.with_json_traces,
             Color::is_enabled(args.color),
             &args.command,
+            rewards_file,
+            snapshot_file,
         );
         (Some(m), t)
     };
@@ -190,6 +200,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::DumpTracesSchema(args) => cmd::dump_schemas::run(args).await,
         Command::MigrateChainDB(args) => cmd::migrate_chain_db::run(args).await,
         Command::ResetToEpoch(args) => cmd::reset_to_epoch::run(args).await,
+        Command::StakeSummary(args) => {
+            cmd::stake_summary::run(args).map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())) as Box<dyn std::error::Error>)
+        },
     };
 
     // TODO: we might also want to integrate this into a graceful shutdown system, and into a panic hook

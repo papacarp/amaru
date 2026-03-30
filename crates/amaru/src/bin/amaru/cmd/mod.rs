@@ -25,9 +25,12 @@ pub(crate) mod fetch_chain_headers;
 pub(crate) mod import_headers;
 pub(crate) mod import_ledger_state;
 pub(crate) mod import_nonces;
+pub(crate) mod live_stake_detailed;
 pub(crate) mod migrate_chain_db;
 pub(crate) mod reset_to_epoch;
 pub(crate) mod run;
+pub(crate) mod stake_summary;
+pub(crate) mod tip;
 
 /// Establish a connection to another peer. The connection are discriminated by network types.
 pub(crate) async fn connect_to_peer(

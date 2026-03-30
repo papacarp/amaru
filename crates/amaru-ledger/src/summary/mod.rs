@@ -120,11 +120,19 @@ impl ::serde::Serialize for Pots {
 pub type SafeRatio = Ratio<BigUint>;
 
 pub fn safe_ratio(numerator: u64, denominator: u64) -> SafeRatio {
-    SafeRatio::new(BigUint::from(numerator), BigUint::from(denominator))
+    if denominator == 0 {
+        SafeRatio::new(BigUint::from(0u64), BigUint::from(1u64))
+    } else {
+        SafeRatio::new(BigUint::from(numerator), BigUint::from(denominator))
+    }
 }
 
 pub fn into_safe_ratio(ratio: &RationalNumber) -> SafeRatio {
-    SafeRatio::new(BigUint::from(ratio.numerator), BigUint::from(ratio.denominator))
+    if ratio.denominator == 0 {
+        SafeRatio::new(BigUint::from(0u64), BigUint::from(1u64))
+    } else {
+        SafeRatio::new(BigUint::from(ratio.numerator), BigUint::from(ratio.denominator))
+    }
 }
 
 fn serialize_safe_ratio(r: &SafeRatio) -> String {

@@ -144,6 +144,10 @@ pub async fn stage(
             // don't propagate new tip messages when using the initiator side of a connection.
             State::Initiator(s)
         }
+        (state @ State::Handshake { .. }, ConnectionMessage::NewTip(_)) => {
+            // Incoming client (e.g. Oura) may send NewTip before handshake completes; ignore.
+            state
+        }
         (state @ (State::Initial | State::Handshake { .. }), msg @ ConnectionMessage::FetchBlocks { .. }) => {
             // The peer might be still connecting. In that case we reschedule the message
             // If the peer eventually can't be fully initialized, the caller timeout will trigger.

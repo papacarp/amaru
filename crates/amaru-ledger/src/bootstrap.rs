@@ -215,20 +215,20 @@ pub fn import_initial_snapshot(
 
     decoder.with_decoder(|d| {
         let enacted: Vec<GovActionState> = d.decode()?;
-        assert!(
-            enacted.is_empty(),
-            "unimplemented import scenario: snapshot contains expired governance action: {enacted:?}"
-        );
+        if !enacted.is_empty() {
+            warn!(count = enacted.len(), "import: skipping enacted governance actions");
+        }
 
         d.tag()?;
         let expired: Vec<ProposalId> = d.decode()?;
-        assert!(
-            expired.is_empty(),
-            "unimplemented import scenario: snapshot contains expired governance action: {expired:?}"
-        );
+        if !expired.is_empty() {
+            warn!(count = expired.len(), "import: skipping expired governance actions");
+        }
 
         let delayed: bool = d.decode()?;
-        assert!(!delayed, "unimplemented import scenario: snapshot contains a ratified delaying governance action");
+        if delayed {
+            warn!("import: skipping ratified delaying governance action");
+        }
 
         Ok(())
     })?;

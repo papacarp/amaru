@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::{rewards_file_logger, snapshot_file_logger};
 use std::{
     env::{VarError, var},
     error::Error,
@@ -42,7 +43,8 @@ use tracing_subscriber::{
 
 const AMARU_LOG_VAR: &str = "AMARU_LOG";
 
-const DEFAULT_AMARU_LOG_FILTER: &str = "info,amaru::consensus=debug,amaru::ledger=debug,pure_stage=warn";
+const DEFAULT_AMARU_LOG_FILTER: &str =
+    "info,amaru::consensus=debug,amaru::ledger=debug,amaru_protocols=warn,pure_stage=warn,amaru::ledger::state::stake_distribution=warn";
 
 const AMARU_TRACE_VAR: &str = "AMARU_TRACE";
 
@@ -177,6 +179,15 @@ impl TracingSubscriber<Registry> {
     }
 
     pub fn init(self, color: bool) {
+        self.init_with_file_loggers(color, None, None)
+    }
+
+    pub fn init_with_file_loggers(
+        self,
+        color: bool,
+        rewards_file_path: Option<std::path::PathBuf>,
+        snapshot_file_path: Option<std::path::PathBuf>,
+    ) {
         let (default_filter, warning) = new_default_filter(AMARU_LOG_VAR, DEFAULT_AMARU_LOG_FILTER);
 
         let log_format = || tracing_subscriber::fmt::format().with_ansi(color).compact();
@@ -184,28 +195,100 @@ impl TracingSubscriber<Registry> {
         let log_events = || FmtSpan::CLOSE;
         let log_filter = || default_filter;
 
+        let rewards_logger = if let Some(ref path) = rewards_file_path {
+            rewards_file_logger::RewardsFileLogger::new(path.clone()).ok()
+        } else {
+            None
+        };
+        
+        let snapshot_logger = if let Some(ref path) = snapshot_file_path {
+            snapshot_file_logger::SnapshotFileLogger::new(path.clone()).ok()
+        } else {
+            None
+        };
+
         match self {
             TracingSubscriber::Empty => unreachable!(),
-            TracingSubscriber::Registry(registry) => registry
+            TracingSubscriber::Registry(registry) => {
+                let subscriber = registry
                 .with(
                     tracing_subscriber::fmt::layer()
                         .with_writer(log_writer())
                         .event_format(log_format())
                         .with_span_events(log_events())
                         .with_filter(log_filter()),
-                )
-                .init(),
-            TracingSubscriber::WithOpenTelemetry(layered) => layered
+                    );
+                match (rewards_logger, snapshot_logger) {
+                    (Some(rewards), Some(snapshot)) => {
+                        subscriber.with(rewards).with(snapshot).init();
+                    }
+                    (Some(rewards), None) => {
+                        subscriber.with(rewards).init();
+                    }
+                    (None, Some(snapshot)) => {
+                        subscriber.with(snapshot).init();
+                    }
+                    (None, None) => {
+                        subscriber.init();
+                    }
+                }
+            }
+            TracingSubscriber::WithOpenTelemetry(layered) => {
+                let subscriber = layered
                 .with(
                     tracing_subscriber::fmt::layer()
                         .with_writer(log_writer())
                         .event_format(log_format())
                         .with_span_events(log_events())
                         .with_filter(log_filter()),
-                )
-                .init(),
-            TracingSubscriber::WithJson(layered) => layered.init(),
-            TracingSubscriber::WithBoth(layered) => layered.init(),
+                    );
+                match (rewards_logger, snapshot_logger) {
+                    (Some(rewards), Some(snapshot)) => {
+                        subscriber.with(rewards).with(snapshot).init();
+                    }
+                    (Some(rewards), None) => {
+                        subscriber.with(rewards).init();
+                    }
+                    (None, Some(snapshot)) => {
+                        subscriber.with(snapshot).init();
+                    }
+                    (None, None) => {
+                        subscriber.init();
+                    }
+                }
+            }
+            TracingSubscriber::WithJson(layered) => {
+                match (rewards_logger, snapshot_logger) {
+                    (Some(rewards), Some(snapshot)) => {
+                        layered.with(rewards).with(snapshot).init();
+                    }
+                    (Some(rewards), None) => {
+                        layered.with(rewards).init();
+                    }
+                    (None, Some(snapshot)) => {
+                        layered.with(snapshot).init();
+                    }
+                    (None, None) => {
+                        layered.init();
+                    }
+                }
+            }
+            TracingSubscriber::WithBoth(layered) => {
+                match (rewards_logger, snapshot_logger) {
+                    (Some(rewards), Some(snapshot)) => {
+                        layered.with(rewards).with(snapshot).init();
+                    }
+                    (Some(rewards), None) => {
+                        layered.with(rewards).init();
+                    }
+                    (None, Some(snapshot)) => {
+                        layered.with(snapshot).init();
+                    }
+                    (None, None) => {
+                        layered.init();
+                    }
+                }
+            }
         };
 
         if let Some(notify) = warning {
@@ -344,7 +427,7 @@ pub fn setup_open_telemetry(
         .with_resource(resource)
         .build();
 
-    // FIXME RK: this doesn’t seem to be used anywhere?
+    // FIXME RK: this doesn't seem to be used anywhere?
     opentelemetry::global::set_meter_provider(metrics_provider.clone());
 
     // Subscriber
@@ -497,6 +580,17 @@ pub fn setup_observability(
     color: bool,
     hints: &impl ObservabilityHints,
 ) -> (Option<SdkMeterProvider>, Box<dyn FnOnce() -> Result<(), Box<dyn std::error::Error>>>) {
+    setup_observability_with_loggers(with_open_telemetry, with_json_traces, color, hints, None, None)
+}
+
+pub fn setup_observability_with_loggers(
+    with_open_telemetry: bool,
+    with_json_traces: bool,
+    color: bool,
+    hints: &impl ObservabilityHints,
+    rewards_file_path: Option<std::path::PathBuf>,
+    snapshot_file_path: Option<std::path::PathBuf>,
+) -> (Option<SdkMeterProvider>, Box<dyn FnOnce() -> Result<(), Box<dyn std::error::Error>>>) {
     let mut subscriber = TracingSubscriber::new();
 
     let (OpenTelemetryHandle { metrics, teardown }, warning_otlp) = if with_open_telemetry {
@@ -507,9 +601,8 @@ pub fn setup_observability(
 
     let warning_json = if with_json_traces { setup_json_traces(&mut subscriber) } else { None };
 
-    subscriber.init(color);
+    subscriber.init_with_file_loggers(color, rewards_file_path, snapshot_file_path);
 
-    // NOTE: Both warnings are bound to the same ENV var, so `.or` prevents from logging it twice.
     if let Some(notify) = warning_otlp.or(warning_json) {
         notify();
     }
