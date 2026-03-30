@@ -15,7 +15,7 @@
 use std::{
     borrow::Cow,
     cmp::max,
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     ops::Deref,
     sync::{Arc, Mutex, MutexGuard},
 };
@@ -379,20 +379,16 @@ impl<S: Store, HS: HistoricalStores> State<S, HS> {
         )?;
 
         let protocol_parameters = if should_begin_epoch {
+            let roots = db.proposals_roots()?;
+            let proposals = db.iter_proposals()?.collect::<Vec<_>>();
+            let proposals = sort_proposals_for_ratification(proposals, &roots);
             begin_epoch(
                 &batch,
                 next_epoch,
                 &self.era_history,
                 ratification_context,
-                // Get all proposals to ratify / enact. Note that, even though the ratification happens
-                // with an epoch of delay (and thus, using data from a snapshot), we always use the most
-                // recent set of proposals available. While recently submitted proposals won't have any
-                // votes, they might still end up being pruned due to a previous proposal being enacted.
-                //
-                // FIXME: We shouldn't collect all proposals here, but provides iterators for the
-                // ratification step to go over them lazily.
-                db.iter_proposals()?.collect::<Vec<_>>(),
-                db.proposals_roots()?,
+                proposals,
+                roots,
                 &self.protocol_parameters,
             )
         } else {
@@ -877,6 +873,58 @@ pub fn tick_proposals<'store>(
     refund_many(db, refunds.into_iter())?;
 
     Ok(ctx.protocol_parameters)
+}
+
+fn parent_id_of(action: &amaru_kernel::GovernanceAction) -> Option<ComparableProposalId> {
+    use amaru_kernel::GovernanceAction::*;
+    use amaru_kernel::Nullable;
+    let nullable = match action {
+        ParameterChange(p, _, _) => p,
+        HardForkInitiation(p, _) => p,
+        UpdateCommittee(p, _, _, _) => p,
+        NoConfidence(p) => p,
+        NewConstitution(p, _) => p,
+        TreasuryWithdrawals(_, _) | Information => return None,
+    };
+    match nullable {
+        Nullable::Some(id) => Some(ComparableProposalId::from(id.clone())),
+        _ => None,
+    }
+}
+
+fn sort_proposals_for_ratification(
+    mut proposals: Vec<(ComparableProposalId, crate::store::columns::proposals::Row)>,
+    roots: &ProposalsRoots,
+) -> Vec<(ComparableProposalId, crate::store::columns::proposals::Row)> {
+    let root_ids: BTreeSet<&ComparableProposalId> = [
+        roots.protocol_parameters.as_ref(),
+        roots.hard_fork.as_ref(),
+        roots.constitutional_committee.as_ref(),
+        roots.constitution.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+
+    let mut sorted = Vec::with_capacity(proposals.len());
+    while !proposals.is_empty() {
+        let (ready, rest): (Vec<_>, Vec<_>) = proposals
+            .into_iter()
+            .partition(|(_id, row)| {
+                let parent = parent_id_of(&row.proposal.gov_action);
+                match &parent {
+                    None => true,
+                    Some(p) => root_ids.contains(p) || sorted.iter().any(|(sid, _)| sid == p),
+                }
+            });
+        if ready.is_empty() {
+            sorted.extend(rest);
+            break;
+        }
+        sorted.extend(ready);
+        proposals = rest;
+    }
+    sorted
 }
 
 #[observability_trace(INFO, amaru::ledger::state::RATIFICATION_CONTEXT_NEW)]
