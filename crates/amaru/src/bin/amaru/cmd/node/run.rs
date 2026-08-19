@@ -296,6 +296,24 @@ pub struct Args {
     #[command(flatten)]
     global_parameters: GlobalParameters,
 
+    /// Base path for PoolTool rewards CSV export (one file per epoch).
+    #[arg(
+        long,
+        value_name = amaru::value_names::FILEPATH,
+        display_order = 0,
+        help_heading = "PoolTool Export",
+    )]
+    pub rewards_file: Option<PathBuf>,
+
+    /// Base path for PoolTool stake snapshot CBOR export (one file per epoch).
+    #[arg(
+        long,
+        value_name = amaru::value_names::FILEPATH,
+        display_order = 0,
+        help_heading = "PoolTool Export",
+    )]
+    pub snapshot_file: Option<PathBuf>,
+
     /// Show global network parameter overrides, for custom testnets.
     #[arg(long)]
     pub(crate) help_global_parameters: bool,

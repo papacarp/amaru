@@ -29,6 +29,8 @@ mod cli;
 mod cmd;
 mod pid;
 
+use cli::Command;
+
 #[cfg(not(target_family = "windows"))]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
@@ -55,6 +57,17 @@ fn try_main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    if matches!(
+        &cli.command,
+        Command::LegacyStakeSummary(_) | Command::LegacyLiveStakeDetailed(_)
+    ) {
+        return match cli.command {
+            Command::LegacyStakeSummary(args) => cmd::stake_summary::run(args),
+            Command::LegacyLiveStakeDetailed(args) => cmd::live_stake_detailed::run(args),
+            _ => Ok(()),
+        };
+    }
+
     let signals = install_termination_signals().context("failed to install signal handlers")?;
 
     let color_enabled = Color::is_enabled(cli.color);
@@ -63,6 +76,7 @@ fn try_main() -> anyhow::Result<()> {
     let with_json_traces = cli.with_json_traces;
     let skip_logging = cli.command.skip_logging();
     let tui_settings = cli.command.tui_settings();
+    let file_loggers = cli.command.pooltool_file_loggers();
     // Capture observability hints before the command is consumed into a Runnable.
     let listen_address = cli.command.listen_address().map(str::to_owned);
 
@@ -99,6 +113,7 @@ fn try_main() -> anyhow::Result<()> {
             local,
             color_enabled,
             &ListenAddressHint(listen_address.as_deref()),
+            file_loggers,
         )
         .context("failed to configure observability")?;
         // Record precise binary identity in operator logs as soon as tracing is live.

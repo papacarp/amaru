@@ -16,10 +16,13 @@ use std::{
     env::{VarError, var},
     error::Error,
     io::{self, IsTerminal},
+    path::PathBuf,
     str::FromStr,
     sync::{OnceLock, mpsc},
     time::{Duration, Instant},
 };
+
+use crate::{rewards_file_logger, snapshot_file_logger};
 
 use amaru_metrics::{METRICS_METER_NAME, Meter};
 use amaru_node::telemetry::{OpenTelemetryProviders, OtelSignals};
@@ -90,6 +93,26 @@ type LocalTelemetryFilter<S> = Filtered<TelemetryCaptureLayer, OtelErrorFilter, 
 type LocalTelemetryLayer<S> = Layered<LocalTelemetryFilter<S>, S>;
 
 type DelayedWarning = Option<Box<dyn FnOnce()>>;
+
+#[derive(Debug, Default, Clone)]
+pub struct PoolToolFileLoggers {
+    pub rewards_file: Option<PathBuf>,
+    pub snapshot_file: Option<PathBuf>,
+}
+
+fn build_pooltool_layers(
+    rewards_file: Option<PathBuf>,
+    snapshot_file: Option<PathBuf>,
+) -> (
+    Option<rewards_file_logger::RewardsFileLogger>,
+    Option<snapshot_file_logger::SnapshotFileLogger>,
+) {
+    let rewards_logger = rewards_file
+        .and_then(|path| rewards_file_logger::RewardsFileLogger::new(path).ok());
+    let snapshot_logger = snapshot_file
+        .and_then(|path| snapshot_file_logger::SnapshotFileLogger::new(path).ok());
+    (rewards_logger, snapshot_logger)
+}
 
 // JSON event formatting (single-pass CBOR-aware NDJSON) lives in
 // `amaru_observability::json_format`. Console field formatting (CBOR decode +
@@ -177,50 +200,77 @@ impl TracingSubscriber<Registry> {
     }
 
     pub fn init(self, color: bool) -> DelayedWarning {
+        self.init_with_file_loggers(color, PoolToolFileLoggers::default())
+    }
+
+    pub fn init_with_file_loggers(self, color: bool, file_loggers: PoolToolFileLoggers) -> DelayedWarning {
+        let (rewards_logger, snapshot_logger) =
+            build_pooltool_layers(file_loggers.rewards_file, file_loggers.snapshot_file);
+
         match self {
             TracingSubscriber::Empty => unreachable!(),
             TracingSubscriber::Registry(registry) => {
                 let (default_filter, warning) = new_log_filter();
-                registry
-                    .with(
-                        tracing_subscriber::fmt::layer()
-                            .with_writer(io::stderr as fn() -> io::Stderr)
-                            .with_ansi(color)
-                            .fmt_fields(console_field_formatter())
-                            .with_span_events(FmtSpan::CLOSE)
-                            .event_format(CborConsoleEventFormat::new().with_ansi(color))
-                            .with_filter(default_filter),
-                    )
-                    .init();
+                let subscriber = registry.with(
+                    tracing_subscriber::fmt::layer()
+                        .with_writer(io::stderr as fn() -> io::Stderr)
+                        .with_ansi(color)
+                        .fmt_fields(console_field_formatter())
+                        .with_span_events(FmtSpan::CLOSE)
+                        .event_format(CborConsoleEventFormat::new().with_ansi(color))
+                        .with_filter(default_filter),
+                );
+                match (rewards_logger, snapshot_logger) {
+                    (Some(rewards), Some(snapshot)) => subscriber.with(rewards).with(snapshot).init(),
+                    (Some(rewards), None) => subscriber.with(rewards).init(),
+                    (None, Some(snapshot)) => subscriber.with(snapshot).init(),
+                    (None, None) => subscriber.init(),
+                }
                 return warning;
             }
             TracingSubscriber::WithOpenTelemetry(layered) => {
                 let (default_filter, warning) = new_log_filter();
-                layered
-                    .with(
-                        tracing_subscriber::fmt::layer()
-                            .with_writer(io::stderr as fn() -> io::Stderr)
-                            .with_ansi(color)
-                            .fmt_fields(console_field_formatter())
-                            .with_span_events(FmtSpan::CLOSE)
-                            .event_format(CborConsoleEventFormat::new().with_ansi(color))
-                            .with_filter(default_filter),
-                    )
-                    .init();
+                let subscriber = layered.with(
+                    tracing_subscriber::fmt::layer()
+                        .with_writer(io::stderr as fn() -> io::Stderr)
+                        .with_ansi(color)
+                        .fmt_fields(console_field_formatter())
+                        .with_span_events(FmtSpan::CLOSE)
+                        .event_format(CborConsoleEventFormat::new().with_ansi(color))
+                        .with_filter(default_filter),
+                );
+                match (rewards_logger, snapshot_logger) {
+                    (Some(rewards), Some(snapshot)) => subscriber.with(rewards).with(snapshot).init(),
+                    (Some(rewards), None) => subscriber.with(rewards).init(),
+                    (None, Some(snapshot)) => subscriber.with(snapshot).init(),
+                    (None, None) => subscriber.init(),
+                }
                 return warning;
             }
-            TracingSubscriber::WithLocalTelemetry(layered) => {
-                layered.init();
-            }
-            TracingSubscriber::WithLocalTelemetryAndOpenTelemetry(layered) => {
-                layered.init();
-            }
-            TracingSubscriber::WithJson(layered) => {
-                layered.init();
-            }
-            TracingSubscriber::WithJsonAndOpenTelemetry(layered) => {
-                layered.init();
-            }
+            TracingSubscriber::WithLocalTelemetry(layered) => match (rewards_logger, snapshot_logger) {
+                (Some(rewards), Some(snapshot)) => layered.with(rewards).with(snapshot).init(),
+                (Some(rewards), None) => layered.with(rewards).init(),
+                (None, Some(snapshot)) => layered.with(snapshot).init(),
+                (None, None) => layered.init(),
+            },
+            TracingSubscriber::WithLocalTelemetryAndOpenTelemetry(layered) => match (rewards_logger, snapshot_logger) {
+                (Some(rewards), Some(snapshot)) => layered.with(rewards).with(snapshot).init(),
+                (Some(rewards), None) => layered.with(rewards).init(),
+                (None, Some(snapshot)) => layered.with(snapshot).init(),
+                (None, None) => layered.init(),
+            },
+            TracingSubscriber::WithJson(layered) => match (rewards_logger, snapshot_logger) {
+                (Some(rewards), Some(snapshot)) => layered.with(rewards).with(snapshot).init(),
+                (Some(rewards), None) => layered.with(rewards).init(),
+                (None, Some(snapshot)) => layered.with(snapshot).init(),
+                (None, None) => layered.init(),
+            },
+            TracingSubscriber::WithJsonAndOpenTelemetry(layered) => match (rewards_logger, snapshot_logger) {
+                (Some(rewards), Some(snapshot)) => layered.with(rewards).with(snapshot).init(),
+                (Some(rewards), None) => layered.with(rewards).init(),
+                (None, Some(snapshot)) => layered.with(snapshot).init(),
+                (None, None) => layered.init(),
+            },
         }
 
         None
@@ -629,8 +679,17 @@ pub fn setup_observability(
     local: Option<LocalTelemetry>,
     color: bool,
     hints: &impl ObservabilityHints,
+    file_loggers: PoolToolFileLoggers,
 ) -> OpenTelemetryHandle {
-    try_setup_observability(with_open_telemetry, open_telemetry_signals, with_json_traces, local, color, hints)
+    try_setup_observability(
+        with_open_telemetry,
+        open_telemetry_signals,
+        with_json_traces,
+        local,
+        color,
+        hints,
+        file_loggers,
+    )
         .unwrap_or_else(|error| panic!("failed to configure observability: {error}"))
 }
 
@@ -641,6 +700,7 @@ pub fn try_setup_observability(
     local: Option<LocalTelemetry>,
     color: bool,
     hints: &impl ObservabilityHints,
+    file_loggers: PoolToolFileLoggers,
 ) -> anyhow::Result<OpenTelemetryHandle> {
     let mut subscriber = TracingSubscriber::new();
 
@@ -661,7 +721,7 @@ pub fn try_setup_observability(
 
     let warning_json = if with_json_traces { setup_json_traces(&mut subscriber) } else { None };
 
-    let warning_log = subscriber.init(color);
+    let warning_log = subscriber.init_with_file_loggers(color, file_loggers);
 
     for notify in [warning_otlp, warning_local, warning_json, warning_log].into_iter().flatten() {
         notify();

@@ -18,7 +18,9 @@ use std::{
     sync::{OnceLock, atomic, atomic::AtomicUsize},
 };
 
-use amaru_kernel::{Credential, DRep, Epoch, Hash, Lovelace, NetworkName, PoolId, SortedPairs, safe_ratio};
+use amaru_kernel::{
+    AsHash, Credential, DRep, Epoch, Hash, Lovelace, NetworkName, PoolId, SortedPairs, safe_ratio,
+};
 use amaru_observability::info;
 use serde::ser::SerializeStruct;
 
@@ -31,6 +33,15 @@ use crate::{
         serde::serialize_map,
     },
 };
+
+const EVENT_TARGET: &str = "amaru::ledger::state::stake_distribution";
+
+#[derive(serde::Serialize)]
+struct AccountLovelaceOnly {
+    lovelace: Lovelace,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pool: Option<String>,
+}
 
 /// A stake summary snapshot useful for:
 ///
@@ -267,6 +278,37 @@ impl StakeSummary {
             active_stake,
             pools_voting_stake,
             dreps_voting_stake,
+        );
+
+        let accounts_json: BTreeMap<String, AccountLovelaceOnly> = accounts
+            .iter()
+            .map(|(credential, account)| {
+                let credential_hex = hex::encode(credential.as_hash().as_slice());
+                let pool_hex = account.pool.as_ref().map(hex::encode);
+                (
+                    credential_hex,
+                    AccountLovelaceOnly {
+                        lovelace: account.balance,
+                        pool: pool_hex,
+                    },
+                )
+            })
+            .collect();
+        let accounts_json_str = serde_json::to_string(&accounts_json).unwrap_or_else(|_| "{}".to_string());
+        let pools_json_str = serde_json::to_string(&pools).unwrap_or_else(|_| "{}".to_string());
+
+        tracing::info!(
+            target: EVENT_TARGET,
+            epoch = %epoch,
+            accounts = %accounts.len(),
+            dreps = %dreps.len(),
+            pools = %pools.len(),
+            active_stake = %active_stake,
+            pools_voting_stake = %pools_voting_stake,
+            dreps_voting_stake = %dreps_voting_stake,
+            accounts_json = %accounts_json_str,
+            pools_json = %pools_json_str,
+            "stake_distribution.snapshot",
         );
 
         Ok(Self {

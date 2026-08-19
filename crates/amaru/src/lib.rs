@@ -19,9 +19,13 @@ use amaru_kernel::NetworkName;
 
 pub mod exit;
 pub mod lifecycle;
+pub mod live_stake_tracker;
 pub mod metrics;
 pub mod observability;
 pub mod panic;
+pub mod rewards_file_logger;
+pub mod rewards_hook;
+pub mod snapshot_file_logger;
 pub mod version;
 
 // Re-export bootstrap for CLI and legacy callers; new code should depend on `amaru-bootstrap`.

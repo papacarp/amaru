@@ -13,12 +13,12 @@
 // limitations under the License.
 
 use crate::{
-    Hash, Lovelace, PoolId, PoolMetadata, RationalNumber, Relay, RewardAccount, cbor,
+    AsHash, Hash, Lovelace, PoolId, PoolMetadata, RationalNumber, Relay, RewardAccount, cbor,
     size::{KEY, VRF_KEY},
     utils::cbor::SerialisedAsSet,
 };
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 pub struct PoolParams {
     pub id: PoolId,
     pub vrf: Hash<VRF_KEY>,
@@ -78,6 +78,98 @@ impl<'b, C: cbor::HasProtocolVersion> cbor::decode::Decode<'b, C> for PoolParams
                 metadata: d.decode_with(ctx)?,
             })
         })
+    }
+}
+
+impl serde::Serialize for PoolParams {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use std::collections::BTreeMap;
+
+        use serde::ser::SerializeStruct;
+
+        use crate::Address;
+
+        fn as_lovelace_map(n: u64) -> BTreeMap<String, BTreeMap<String, u64>> {
+            let mut lovelace = BTreeMap::new();
+            lovelace.insert("lovelace".to_string(), n);
+            let mut ada = BTreeMap::new();
+            ada.insert("ada".to_string(), lovelace);
+            ada
+        }
+
+        fn as_string_ratio(r: &RationalNumber) -> String {
+            format!("{}/{}", r.numerator, r.denominator)
+        }
+
+        fn as_bech32_addr(bytes: &[u8]) -> Result<String, String> {
+            Address::from_bytes(bytes)
+                .and_then(|addr| addr.to_bech32())
+                .ok_or_else(|| "invalid reward account address".to_string())
+        }
+
+        struct WrapRelay<'a>(&'a Relay);
+
+        impl serde::Serialize for WrapRelay<'_> {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                match self.0 {
+                    Relay::SingleHostAddr(port, ipv4, ipv6) => {
+                        let mut s = serializer.serialize_struct("Relay::SingleHostAddr", 4)?;
+                        s.serialize_field("type", "ipAddress")?;
+                        if let Some(ipv4) = ipv4 {
+                            s.serialize_field("ipv4", &format!("{}.{}.{}.{}", ipv4[0], ipv4[1], ipv4[2], ipv4[3]))?;
+                        }
+                        if let Some(ipv6) = ipv6 {
+                            let bytes: [u8; 16] = [
+                                ipv6[3], ipv6[2], ipv6[1], ipv6[0],
+                                ipv6[7], ipv6[6], ipv6[5], ipv6[4],
+                                ipv6[11], ipv6[10], ipv6[9], ipv6[8],
+                                ipv6[15], ipv6[14], ipv6[13], ipv6[12],
+                            ];
+                            s.serialize_field("ipv6", &format!("{}", std::net::Ipv6Addr::from(bytes)))?;
+                        }
+                        if let Some(port) = port {
+                            s.serialize_field("port", port)?;
+                        }
+                        s.end()
+                    }
+                    Relay::SingleHostName(port, hostname) => {
+                        let mut s = serializer.serialize_struct("Relay::SingleHostName", 3)?;
+                        s.serialize_field("type", "hostname")?;
+                        s.serialize_field("hostname", hostname.as_ref())?;
+                        if let Some(port) = port {
+                            s.serialize_field("port", port)?;
+                        }
+                        s.end()
+                    }
+                    Relay::MultiHostName(hostname) => {
+                        let mut s = serializer.serialize_struct("Relay::MultiHostName", 2)?;
+                        s.serialize_field("type", "hostname")?;
+                        s.serialize_field("hostname", hostname.as_ref())?;
+                        s.end()
+                    }
+                }
+            }
+        }
+
+        let reward_account_hex_str = hex::encode(self.reward_account.credential().as_hash().as_slice());
+
+        let mut s = serializer.serialize_struct("PoolParams", 10)?;
+        s.serialize_field("id", &hex::encode(self.id))?;
+        s.serialize_field("vrfVerificationKeyHash", &hex::encode(self.vrf))?;
+        s.serialize_field("pledge", &as_lovelace_map(self.pledge))?;
+        s.serialize_field("cost", &as_lovelace_map(self.cost))?;
+        s.serialize_field("margin", &as_string_ratio(&self.margin))?;
+        s.serialize_field(
+            "rewardAccount",
+            &as_bech32_addr(&self.reward_account).map_err(serde::ser::Error::custom)?,
+        )?;
+        s.serialize_field("rewardAccountHex", &reward_account_hex_str)?;
+        s.serialize_field("owners", &self.owners.iter().map(hex::encode).collect::<Vec<String>>())?;
+        s.serialize_field("relays", &self.relays.iter().map(WrapRelay).collect::<Vec<WrapRelay<'_>>>())?;
+        if let Some(metadata) = &self.metadata {
+            s.serialize_field("metadata", metadata)?;
+        }
+        s.end()
     }
 }
 

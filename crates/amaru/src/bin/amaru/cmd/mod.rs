@@ -17,11 +17,13 @@ use std::{ops::Deref, str::FromStr};
 use amaru_kernel::{HeaderHash, Point};
 
 pub(crate) mod dev;
+pub(crate) mod live_stake_detailed;
 #[cfg(feature = "mithril")]
 pub(crate) mod mithril;
 pub(crate) mod node;
 pub(crate) mod shell_completions;
 pub(crate) mod snapshot;
+pub(crate) mod stake_summary;
 
 #[derive(Debug, Clone)]
 pub(crate) struct PointOrHash(pub(crate) HeaderHash);

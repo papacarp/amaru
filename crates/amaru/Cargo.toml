@@ -30,6 +30,7 @@ test-utils = ["amaru-consensus/test-utils"]
 [dependencies]
 # External dependencies ───────────────────────────────────────────────────────┐
 anyhow.workspace = true
+cbor4ii.workspace = true
 clap.workspace = true
 clap_complete.workspace = true
 clap_mangen.workspace = true

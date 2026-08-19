@@ -110,7 +110,7 @@ certain mutations are applied to the system.
 use std::collections::{BTreeMap, BTreeSet};
 
 use amaru_kernel::{
-    Credential, Epoch, GlobalParameters, Lovelace, PoolId, ProtocolParameters, SafeRatio, SortedPairs,
+    AsHash, Credential, Epoch, GlobalParameters, Lovelace, PoolId, ProtocolParameters, SafeRatio, SortedPairs,
     floor_to_lovelace, safe_ratio,
 };
 use amaru_observability::info;
@@ -125,6 +125,8 @@ use crate::{
     store::{Snapshot, StoreError, columns::pots::Row as Pots},
     summary::{AccountState, PoolState, stake_distribution::StakeSummary},
 };
+
+const EVENT_TARGET: &str = "amaru::ledger::state::rewards";
 
 impl PoolState {
     pub fn relative_stake(&self, total_stake: Lovelace) -> SafeRatio {
@@ -235,6 +237,37 @@ impl PoolState {
             // ⌊c + (m + (1 - m) × s / σ) × (R_pool - c)⌋
             //     ⎝___ margin_factor ___⎠
             cost + floor_to_lovelace(margin_factor * BigUint::from(pool_rewards - cost))
+        }
+    }
+
+    /// Breakdown of leader rewards into operator rewards and staking rewards for PoolTool export.
+    pub fn leader_rewards_breakdown(
+        &self,
+        pool_rewards: Lovelace,
+        owner_stake: Lovelace,
+        total_stake: Lovelace,
+    ) -> (Lovelace, Lovelace) {
+        let cost: Lovelace = self.parameters.cost;
+
+        if pool_rewards <= cost {
+            (pool_rewards, 0)
+        } else {
+            let relative_stake = self.relative_stake(total_stake);
+
+            let owner_stake_ratio =
+                if total_stake.is_zero() { SafeRatio::zero() } else { safe_ratio(owner_stake, total_stake) };
+
+            let pool_rewards_above_cost = pool_rewards - cost;
+
+            let operator_rewards =
+                cost + floor_to_lovelace(&self.margin * BigUint::from(pool_rewards_above_cost));
+
+            let staking_rewards = floor_to_lovelace(
+                (SafeRatio::one() - &self.margin) * BigUint::from(pool_rewards_above_cost) * owner_stake_ratio
+                    / relative_stake,
+            );
+
+            (operator_rewards, staking_rewards)
         }
     }
 
@@ -419,6 +452,39 @@ impl RewardsSummary {
             pots_fees = pots.fees,
         );
 
+        let expected_blocks = global_parameters.epoch_length() / global_parameters.active_slot_coeff_inverse;
+        let influence = protocol_parameters.pledge_influence.numerator as f64
+            / protocol_parameters.pledge_influence.denominator as f64;
+        let monetary_expansion_rate_f64 = protocol_parameters.monetary_expansion_rate.numerator as f64
+            / protocol_parameters.monetary_expansion_rate.denominator as f64;
+        let treasury_growth_rate = protocol_parameters.treasury_expansion_rate.numerator as f64
+            / protocol_parameters.treasury_expansion_rate.denominator as f64;
+
+        tracing::info!(
+            target: EVENT_TARGET,
+            epoch = %stake_distribution.epoch,
+            %efficiency,
+            %incentives,
+            %treasury_tax,
+            %total_rewards,
+            %available_rewards,
+            %effective_rewards,
+            pots_reserves = %pots.reserves,
+            pots_treasury = %pots.treasury,
+            pots_fees = %pots.fees,
+            expected_blocks = %expected_blocks,
+            influence = %influence,
+            max_bh_size = %protocol_parameters.max_block_header_size,
+            max_block_size = %protocol_parameters.max_block_body_size,
+            max_epoch = %protocol_parameters.stake_pool_max_retirement_epoch,
+            monetary_expansion_rate = %monetary_expansion_rate_f64,
+            optimal_pool_count = %protocol_parameters.optimal_stake_pools_count,
+            protocol_major = %protocol_parameters.protocol_version.major(),
+            protocol_minor = %protocol_parameters.protocol_version.minor(),
+            treasury_growth_rate = %treasury_growth_rate,
+            "rewards.summary",
+        );
+
         Self {
             epoch: stake_distribution.epoch,
             incentives,
@@ -496,6 +562,14 @@ impl RewardsSummary {
         if let Some(PoolRewards { pot, .. }) = pool_rewards {
             let member_rewards = pool.member_rewards(credential, *pot, account.balance, total_stake);
             if member_rewards > 0 {
+                let credential_hex = hex::encode(credential.as_hash().as_slice());
+                tracing::debug!(
+                    target: EVENT_TARGET,
+                    stake_credential_hex = %credential_hex,
+                    stake_reward = %member_rewards,
+                    leader_reward = 0u64,
+                    "rewards.account_breakdown"
+                );
                 account.rewards += member_rewards;
             }
             member_rewards
@@ -529,8 +603,30 @@ impl RewardsSummary {
 
         let rewards_leader = pool.leader_rewards(rewards_pot, owner_stake, total_stake);
 
+        let (rewards_operator, rewards_staking) =
+            pool.leader_rewards_breakdown(rewards_pot, owner_stake, total_stake);
+        tracing::debug!(
+            target: EVENT_TARGET,
+            pool_id = %hex::encode(pool.parameters.id),
+            pool_id_hex = %hex::encode(pool.parameters.id.as_slice()),
+            leader_total = %rewards_leader,
+            leader_operator = %rewards_operator,
+            leader_staking = %rewards_staking,
+            owner_stake = %owner_stake,
+            total_stake = %total_stake,
+            "rewards.leader_breakdown"
+        );
+
         if rewards_leader > 0 {
             let credential = pool.parameters.reward_account.credential();
+            let reward_account_hex = hex::encode(credential.as_hash().as_slice());
+            tracing::debug!(
+                target: EVENT_TARGET,
+                stake_credential_hex = %reward_account_hex,
+                leader_reward = %rewards_operator,
+                stake_reward = %rewards_staking,
+                "rewards.account_breakdown"
+            );
             leader_recipients.insert(credential);
             if let Some(st) = accounts.get_mut(&credential) {
                 st.rewards += rewards_leader;

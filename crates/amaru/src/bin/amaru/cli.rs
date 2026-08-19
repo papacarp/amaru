@@ -16,7 +16,7 @@ use std::str::FromStr;
 
 use amaru::{
     lifecycle::Runnable,
-    observability::{Color, ObservabilityHints},
+    observability::{Color, ObservabilityHints, PoolToolFileLoggers},
 };
 use amaru_kernel::GlobalParameters;
 use amaru_node::telemetry::{OtelSignal, OtelSignals};
@@ -81,6 +81,12 @@ pub(crate) enum Command {
 
     #[command(hide = true, name = "dump-traces-schema")]
     LegacyDumpTracesSchema(cmd::dev::traces::dump::Args),
+
+    #[command(hide = true, name = "stake-summary")]
+    LegacyStakeSummary(cmd::stake_summary::Args),
+
+    #[command(hide = true, name = "live-stake-detailed")]
+    LegacyLiveStakeDetailed(cmd::live_stake_detailed::Args),
 }
 
 impl Command {
@@ -109,6 +115,9 @@ impl Command {
             Command::LegacyMigrateChainDB(args) => cmd::dev::chain::migrate::runnable(args),
             Command::LegacyRemoveChain(args) => cmd::dev::chain::remove::runnable(args),
             Command::LegacyDumpTracesSchema(args) => cmd::dev::traces::dump::runnable(args),
+            Command::LegacyStakeSummary(_) | Command::LegacyLiveStakeDetailed(_) => {
+                unreachable!("pooltool sync commands are handled before into_runnable")
+            }
         }
     }
 
@@ -140,7 +149,9 @@ impl Command {
             self,
             Command::Dev(cmd::dev::DevCommand::Traces(cmd::dev::traces::TracesCommand::Dump(_)))
                 | Command::Dev(cmd::dev::DevCommand::Traces(cmd::dev::traces::TracesCommand::Schema(_)))
-                | Command::LegacyDumpTracesSchema(_)
+                |             Command::LegacyDumpTracesSchema(_)
+                | Command::LegacyStakeSummary(_)
+                | Command::LegacyLiveStakeDetailed(_)
                 | Command::ShellCompletions(_)
         )
     }
@@ -152,6 +163,18 @@ impl Command {
             | Command::LegacyRun(args)
             | Command::LegacyDaemon(args) => Some(args.tui_settings()),
             _ => None,
+        }
+    }
+
+    pub(crate) fn pooltool_file_loggers(&self) -> PoolToolFileLoggers {
+        match self {
+            Command::Node(cmd::node::NodeCommand::Run(args))
+            | Command::LegacyRun(args)
+            | Command::LegacyDaemon(args) => PoolToolFileLoggers {
+                rewards_file: args.rewards_file.clone(),
+                snapshot_file: args.snapshot_file.clone(),
+            },
+            _ => PoolToolFileLoggers::default(),
         }
     }
 }
