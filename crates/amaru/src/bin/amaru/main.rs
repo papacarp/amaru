@@ -62,8 +62,12 @@ fn try_main() -> anyhow::Result<()> {
         Command::LegacyStakeSummary(_) | Command::LegacyLiveStakeDetailed(_)
     ) {
         return match cli.command {
-            Command::LegacyStakeSummary(args) => cmd::stake_summary::run(args),
-            Command::LegacyLiveStakeDetailed(args) => cmd::live_stake_detailed::run(args),
+            Command::LegacyStakeSummary(args) => {
+                cmd::stake_summary::run(args).map_err(|e| anyhow!("{e}"))
+            }
+            Command::LegacyLiveStakeDetailed(args) => {
+                cmd::live_stake_detailed::run(args).map_err(|e| anyhow!("{e}"))
+            }
             _ => Ok(()),
         };
     }

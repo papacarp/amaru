@@ -405,6 +405,14 @@ impl RewardsSummary {
 
         let StakeSummary { stake_distribution, mut accounts } = stake_summary;
 
+        // File logger opens the CSV here. account_breakdown events fire in the
+        // loops below; rewards.summary is only emitted after those loops.
+        tracing::info!(
+            target: EVENT_TARGET,
+            epoch = %stake_distribution.epoch,
+            "rewards.begin",
+        );
+
         let mut effective_rewards = stake_distribution.pools.iter().fold(0, |effective_rewards, (pool_id, pool)| {
             let pool_rewards = RewardsSummary::apply_leader_rewards(
                 &mut accounts,

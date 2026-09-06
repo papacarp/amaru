@@ -15,6 +15,11 @@ use tracing_subscriber::{
 };
 use serde::Serialize;
 
+/// Real rewards CSVs are ~75MB. Never truncate a finished file because a later
+/// event carried a different epoch tag (that is how epoch 647 was overwritten
+/// and 648 left as a 6-byte ``0,0,0`` stub).
+const MIN_KEEP_FILE_BYTES: u64 = 1_000_000;
+
 /// File logger that captures rewards breakdown events and writes to CSV files
 /// Format: stake_credential_hex,leader_reward,stake_reward\n
 /// 
@@ -30,6 +35,7 @@ pub struct RewardsFileLogger {
     current_epoch: Arc<Mutex<Option<u64>>>,
     writer: Arc<Mutex<Option<BufWriter<File>>>>,
     line_count: Arc<Mutex<usize>>,
+    wrote_rows: Arc<Mutex<bool>>,
     summary_writer: Arc<Mutex<Option<BufWriter<File>>>>,
     summary_epoch: Arc<Mutex<Option<u64>>>,
 }
@@ -44,6 +50,7 @@ impl RewardsFileLogger {
             current_epoch: Arc::new(Mutex::new(None)),
             writer: Arc::new(Mutex::new(None)),
             line_count: Arc::new(Mutex::new(0)),
+            wrote_rows: Arc::new(Mutex::new(false)),
             summary_writer: Arc::new(Mutex::new(None)),
             summary_epoch: Arc::new(Mutex::new(None)),
         })
@@ -113,10 +120,15 @@ impl RewardsFileLogger {
         if let Some(parent) = file_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        let existing = std::fs::metadata(&file_path).map(|m| m.len()).unwrap_or(0);
+        // Only truncate stubs / empty files. A completed CSV must not be wiped
+        // if a later summary/breakdown names a different epoch.
+        let truncate = existing < MIN_KEEP_FILE_BYTES;
         let file = OpenOptions::new()
             .create(true)
             .write(true)
-            .truncate(true) // Start fresh for each epoch
+            .append(!truncate)
+            .truncate(truncate)
             .open(file_path)?;
         
         // Use a large buffer (1MB) to minimize disk writes for ~1.3M entries
@@ -125,10 +137,45 @@ impl RewardsFileLogger {
         Ok(BufWriter::with_capacity(1_048_576, file))
     }
 
+    fn close_current(&self, write_terminal: bool) {
+        if let Ok(mut writer_opt) = self.writer.lock() {
+            if let Some(mut writer) = writer_opt.take() {
+                if write_terminal {
+                    let _ = writer.write_all(b"0,0,0\n");
+                }
+                let _ = writer.flush();
+            }
+        }
+    }
+
+    fn switch_to_epoch(&self, epoch: u64) {
+        {
+            let current = self.current_epoch.lock().unwrap();
+            let has_writer = self.writer.lock().ok().map(|w| w.is_some()).unwrap_or(false);
+            if *current == Some(epoch) && has_writer {
+                return;
+            }
+        }
+        let wrote = *self.wrote_rows.lock().unwrap();
+        self.close_current(wrote);
+        match self.open_epoch_file(epoch) {
+            Ok(writer) => {
+                *self.writer.lock().unwrap() = Some(writer);
+                *self.current_epoch.lock().unwrap() = Some(epoch);
+                *self.line_count.lock().unwrap() = 0;
+                *self.wrote_rows.lock().unwrap() = false;
+            }
+            Err(e) => {
+                eprintln!("Error opening rewards file for epoch {}: {}", epoch, e);
+            }
+        }
+    }
+
     fn write_line(&self, line: &str) -> Result<(), std::io::Error> {
         if let Ok(mut writer_opt) = self.writer.lock() {
             if let Some(ref mut writer) = *writer_opt {
                 writer.write_all(line.as_bytes())?;
+                *self.wrote_rows.lock().unwrap() = true;
                 
                 // Auto-flush every 10,000 lines to prevent memory issues
                 let mut count = self.line_count.lock().unwrap();
@@ -155,6 +202,13 @@ impl RewardsFileLogger {
 }
 
 impl<S: Subscriber> Layer<S> for RewardsFileLogger {
+    // Do not implement `enabled` / `register_callsite` with Interest::never.
+    // These loggers sit *outside* the console EnvFilter. Layered's Subscriber
+    // short-circuits: an outer layer returning false/never disables the event
+    // for every inner layer too (journal, the other file logger, everything).
+    // That is why the 2026-08-28 resync computed ledger snapshots but wrote
+    // no CSVs and almost no journal. Filter by target inside on_event only.
+
     fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
         // Handle rewards events - match on target and extract message field to identify event type
         if event.metadata().target() == "amaru::ledger::state::rewards" {
@@ -162,8 +216,17 @@ impl<S: Subscriber> Layer<S> for RewardsFileLogger {
             let mut message_visitor = EpochVisitor::default();
             event.record(&mut message_visitor);
             let message = message_visitor.message.as_deref();
-            
-            // Handle rewards.summary event to detect epoch and completion
+
+            // RewardsSummary emits begin, then ~1.3M account_breakdown rows, then
+            // summary. Opening the CSV on summary was too late: rows landed in the
+            // previous epoch's file (647 got a second copy of 648).
+            if message == Some("rewards.begin") {
+                if let Some(epoch) = message_visitor.epoch {
+                    self.switch_to_epoch(epoch);
+                }
+                return;
+            }
+
             if message == Some("rewards.summary") {
                 // Extract all summary fields
                 let mut summary_visitor = RewardsSummaryVisitor::default();
@@ -175,47 +238,11 @@ impl<S: Subscriber> Layer<S> for RewardsFileLogger {
                         eprintln!("Error writing rewards summary: {}", e);
                     }
                 }
-            
-                if let Some(epoch) = message_visitor.epoch {
-                    let mut current_epoch = self.current_epoch.lock().unwrap();
-                    
-                    // Check if this is a new epoch
-                    let is_new_epoch = current_epoch.map(|e| e != epoch).unwrap_or(true);
-                    
-                    if is_new_epoch {
-                        // Close previous file if it exists and write terminal marker
-                        if let Ok(mut writer_opt) = self.writer.lock() {
-                            if let Some(mut writer) = writer_opt.take() {
-                                // Write terminal marker for previous epoch
-                                let _ = writer.write_all(b"0,0,0\n");
-                                let _ = writer.flush();
-                            }
-                        }
-                        
-                        // Close previous summary file if it exists
-                        if let Ok(mut summary_writer_opt) = self.summary_writer.lock() {
-                            if let Some(mut summary_writer) = summary_writer_opt.take() {
-                                let _ = summary_writer.flush();
-                            }
-                        }
-                        *self.summary_epoch.lock().unwrap() = None;
-                        
-                        // Open new file for this epoch
-                        match self.open_epoch_file(epoch) {
-                            Ok(writer) => {
-                                *self.writer.lock().unwrap() = Some(writer);
-                                *current_epoch = Some(epoch);
-                                *self.line_count.lock().unwrap() = 0;
-                            }
-                            Err(e) => {
-                                eprintln!("Error opening rewards file for epoch {}: {}", epoch, e);
-                            }
-                        }
-                    }
-                    
-                    if let Err(e) = self.write_terminal_marker() {
-                        eprintln!("Error writing terminal marker for epoch {}: {}", epoch, e);
-                    }
+
+                // Rows already went to the file opened on rewards.begin. A switch
+                // here used to truncate the *next* epoch to an empty stub.
+                if *self.wrote_rows.lock().unwrap() {
+                    let _ = self.write_terminal_marker();
                 }
                 return;
             }
@@ -225,41 +252,16 @@ impl<S: Subscriber> Layer<S> for RewardsFileLogger {
                 let mut visitor = RewardsAccountVisitor::default();
                 event.record(&mut visitor);
 
-                // Check if this event includes an epoch (leader breakdowns do, member breakdowns don't)
-                let epoch_from_event = visitor.epoch;
-            
-                // Open file if we have an epoch from this event and don't have a file open yet
-                if let Some(epoch) = epoch_from_event {
-                    let mut current_epoch = self.current_epoch.lock().unwrap();
-                    if current_epoch.map(|e| e != epoch).unwrap_or(true) {
-                        // Close previous file if it exists
-                        if let Ok(mut writer_opt) = self.writer.lock() {
-                            if let Some(mut writer) = writer_opt.take() {
-                                let _ = writer.write_all(b"0,0,0\n");
-                                let _ = writer.flush();
-                            }
-                        }
-                        
-                    match self.open_epoch_file(epoch) {
-                        Ok(writer) => {
-                            *self.writer.lock().unwrap() = Some(writer);
-                            *current_epoch = Some(epoch);
-                            *self.line_count.lock().unwrap() = 0;
-                        }
-                        Err(e) => {
-                            eprintln!("Error opening rewards file for epoch {}: {}", epoch, e);
-                            return;
-                        }
+                let current = *self.current_epoch.lock().unwrap();
+                if let Some(epoch) = visitor.epoch {
+                    if current != Some(epoch) {
+                        self.switch_to_epoch(epoch);
                     }
-                    }
-                    drop(current_epoch); // Release lock after opening file
                 }
-                
-            let current_epoch = self.current_epoch.lock().unwrap();
-            if current_epoch.is_none() {
-                return;
-            }
-                drop(current_epoch); // Release lock before processing
+
+                if self.current_epoch.lock().unwrap().is_none() {
+                    return;
+                }
 
                 if let Some(account_data) = visitor.account_data {
                     // Format: stake_credential_hex,leader_reward,stake_reward\n

@@ -93,6 +93,9 @@ impl SnapshotFileLogger {
 }
 
 impl<S: Subscriber> Layer<S> for SnapshotFileLogger {
+    // See rewards_file_logger: Interest::never / enabled=false here globally
+    // disables events for the rest of the subscriber. Filter in on_event only.
+
     fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
         // Handle stake distribution snapshot events
         if event.metadata().target() == "amaru::ledger::state::stake_distribution" {

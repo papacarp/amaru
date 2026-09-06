@@ -87,8 +87,6 @@ impl serde::Serialize for PoolParams {
 
         use serde::ser::SerializeStruct;
 
-        use crate::Address;
-
         fn as_lovelace_map(n: u64) -> BTreeMap<String, BTreeMap<String, u64>> {
             let mut lovelace = BTreeMap::new();
             lovelace.insert("lovelace".to_string(), n);
@@ -99,12 +97,6 @@ impl serde::Serialize for PoolParams {
 
         fn as_string_ratio(r: &RationalNumber) -> String {
             format!("{}/{}", r.numerator, r.denominator)
-        }
-
-        fn as_bech32_addr(bytes: &[u8]) -> Result<String, String> {
-            Address::from_bytes(bytes)
-                .and_then(|addr| addr.to_bech32())
-                .ok_or_else(|| "invalid reward account address".to_string())
         }
 
         struct WrapRelay<'a>(&'a Relay);
@@ -161,7 +153,7 @@ impl serde::Serialize for PoolParams {
         s.serialize_field("margin", &as_string_ratio(&self.margin))?;
         s.serialize_field(
             "rewardAccount",
-            &as_bech32_addr(&self.reward_account).map_err(serde::ser::Error::custom)?,
+            &self.reward_account.to_bech32(),
         )?;
         s.serialize_field("rewardAccountHex", &reward_account_hex_str)?;
         s.serialize_field("owners", &self.owners.iter().map(hex::encode).collect::<Vec<String>>())?;
